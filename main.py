@@ -253,13 +253,13 @@ def evaluate_angle(
     mode="classic",
     sample_points=3000,
     use_clustering=False,
-    cluster_eps=1.5,
-    min_samples=4,
-    support_radius=3.0,
+    cluster_eps=1,
+    min_samples=8,
+    support_radius=0.6,
     min_height=1.0,
     critical_angle_deg=45.0,
-    max_xy_distance=6.0,
-    penalty_weight=10.0,
+    max_xy_distance=5.0,
+    penalty_weight=20.0,
     tree_eps=10.0,
     min_feasible_coverage=0.5
 ):
@@ -322,14 +322,14 @@ async def smart_optimize(
     sample_points_coarse: int = 1500,
     sample_points_refine: int = 3000,
     cluster_eps: float = 1.5,
-    min_samples: int = 4,
+    min_samples: int = 8,
     support_radius: float = 3.0,
     min_height: float = 1.0,
     critical_angle_deg: float = 45.0,
     max_xy_distance: float = 6.0,
-    penalty_weight: float = 10.0,
+    typenal_weight: float = 20.0,
     tree_eps: float = 10.0,
-    min_feasible_coverage: float = 0.5
+    min_feasible_coverage: float = 0.3
 ):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as tmp:
         tmp.write(await file.read())
@@ -549,8 +549,8 @@ async def export_support_stl(
     full_resolution: bool = False,
     export_sample_points: int = 5000,
     cluster_eps: float = 1.5,
-    min_samples: int = 4,
-    support_radius: float = 3.0,
+    min_samples: int = 8,
+    support_radius: float = 1.0,
     min_height: float = 1.0,
     critical_angle_deg: float = 45.0,
     tree_eps: float = 10.0,
