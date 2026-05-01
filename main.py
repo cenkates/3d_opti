@@ -17,23 +17,31 @@ def root():
     return {"message": "API is running"}
 
 
+# =========================================================
+# BASIC GEOMETRY
+# =========================================================
+
 def detect_overhang_faces(mesh, critical_angle_deg=45.0):
     normals = mesh.face_normals
     build_dir = np.array([0.0, 0.0, 1.0])
+
     cos_vals = normals @ build_dir
     angles = np.degrees(np.arccos(np.clip(cos_vals, -1.0, 1.0)))
+
     return np.where(angles > 90.0 + critical_angle_deg)[0]
 
 
 def face_centers(mesh, face_indices):
     if len(face_indices) == 0:
         return np.empty((0, 3))
+
     return mesh.triangles[face_indices].mean(axis=1)
 
 
 def downsample_points(points, max_points=4000):
     if len(points) <= max_points:
         return points
+
     idx = np.random.choice(len(points), max_points, replace=False)
     return points[idx]
 
@@ -43,6 +51,7 @@ def cluster_points(points, eps=1.5, min_samples=4):
         return np.empty((0, 3))
 
     labels = DBSCAN(eps=eps, min_samples=min_samples).fit(points[:, :2]).labels_
+
     clustered = []
 
     for label in set(labels):
@@ -50,6 +59,7 @@ def cluster_points(points, eps=1.5, min_samples=4):
             continue
 
         cluster = points[labels == label]
+
         clustered.append([
             cluster[:, 0].mean(),
             cluster[:, 1].mean(),
@@ -61,6 +71,10 @@ def cluster_points(points, eps=1.5, min_samples=4):
 
     return np.array(clustered)
 
+
+# =========================================================
+# CLASSIC SUPPORT
+# =========================================================
 
 def generate_classic_supports(points, radius=3.0, min_height=1.0):
     supports = []
@@ -81,6 +95,10 @@ def generate_classic_supports(points, radius=3.0, min_height=1.0):
     return supports
 
 
+# =========================================================
+# NEXT LEVEL TREE SUPPORT
+# =========================================================
+
 def generate_tree_supports(
     points,
     radius=3.0,
@@ -92,7 +110,6 @@ def generate_tree_supports(
     if len(points) == 0:
         return {"trunks": [], "branches": []}
 
-    # Büyük bölgeleri tree gruplarına ayır
     labels = DBSCAN(eps=tree_eps, min_samples=1).fit(points[:, :2]).labels_
 
     trunks = []
@@ -101,7 +118,6 @@ def generate_tree_supports(
     for label in set(labels):
         group = points[labels == label]
 
-        # Çok fazla branch çıkmasın diye tekrar cluster
         branch_points = cluster_points(
             group,
             eps=branch_merge_eps,
@@ -111,7 +127,6 @@ def generate_tree_supports(
         if len(branch_points) == 0:
             continue
 
-        # Çok fazla dal varsa en yüksek noktaları seç
         if len(branch_points) > max_branches_per_tree:
             sorted_idx = np.argsort(branch_points[:, 2])[-max_branches_per_tree:]
             branch_points = branch_points[sorted_idx]
@@ -119,7 +134,6 @@ def generate_tree_supports(
         trunk_x = float(branch_points[:, 0].mean())
         trunk_y = float(branch_points[:, 1].mean())
 
-        # Gövde çok yukarı çıkmasın
         trunk_top_z = float(np.percentile(branch_points[:, 2], 35))
 
         if trunk_top_z <= min_height:
@@ -141,13 +155,16 @@ def generate_tree_supports(
             if pz <= trunk_top_z:
                 continue
 
-            # Smooth / bent branch için ara nokta
             mid_x = (trunk_x + px) / 2.0
             mid_y = (trunk_y + py) / 2.0
             mid_z = trunk_top_z + (pz - trunk_top_z) * 0.55
 
-            # yükseklik arttıkça branch biraz kalınlaşsın
-            branch_length = np.linalg.norm([px - trunk_x, py - trunk_y, pz - trunk_top_z])
+            branch_length = np.linalg.norm([
+                px - trunk_x,
+                py - trunk_y,
+                pz - trunk_top_z
+            ])
+
             branch_radius = radius * 0.45 + 0.01 * branch_length
 
             branches.append({
@@ -215,10 +232,17 @@ def tree_to_support_points(tree):
 
     return supports
 
+
+# =========================================================
+# METRICS
+# =========================================================
+
 def support_volume(supports):
     total = 0.0
+
     for s in supports:
         total += np.pi * (s["radius"] ** 2) * s["height"]
+
     return float(total)
 
 
@@ -247,31 +271,40 @@ def coverage(points, supports, max_xy_distance=6.0):
     return float(cov), int(unsupported)
 
 
+# =========================================================
+# EVALUATION
+# =========================================================
+
 def evaluate_angle(
     original_mesh,
     angle,
     mode="classic",
-    sample_points=8000,
+    sample_points=3000,
     use_clustering=False,
-    cluster_eps=2,
+    cluster_eps=1.5,
     min_samples=4,
-    support_radius=0.6,
+    support_radius=3.0,
     min_height=1.0,
     critical_angle_deg=45.0,
-    max_xy_distance=8.0,
-    penalty_weight=20.0,
-    tree_eps=10.0,
-    min_feasible_coverage=0.3
+    max_xy_distance=6.0,
+    penalty_weight=10.0,
+    tree_eps=18.0,
+    min_feasible_coverage=0.5
 ):
     mesh = original_mesh.copy()
     mesh.apply_transform(rotation_matrix(np.radians(angle), [0, 1, 0]))
 
     overhang_faces = detect_overhang_faces(mesh, critical_angle_deg)
     points = face_centers(mesh, overhang_faces)
+
     points = downsample_points(points, sample_points)
 
     if use_clustering:
-        support_points = cluster_points(points, eps=cluster_eps, min_samples=min_samples)
+        support_points = cluster_points(
+            points,
+            eps=cluster_eps,
+            min_samples=min_samples
+        )
     else:
         support_points = points
 
@@ -281,17 +314,29 @@ def evaluate_angle(
             radius=support_radius,
             min_height=min_height
         )
-    else:
+
+    elif mode == "tree":
         tree = generate_tree_supports(
             support_points,
             radius=support_radius,
             tree_eps=tree_eps,
-            min_height=min_height
+            min_height=min_height,
+            max_branches_per_tree=12,
+            branch_merge_eps=6.0
         )
+
         supports = tree_to_support_points(tree)
 
+    else:
+        raise ValueError("mode must be classic or tree")
+
     vol = support_volume(supports)
-    cov, unsupported = coverage(points, supports, max_xy_distance)
+
+    cov, unsupported = coverage(
+        points,
+        supports,
+        max_xy_distance=max_xy_distance
+    )
 
     coverage_penalty = 0.0
     if cov < min_feasible_coverage:
@@ -313,6 +358,10 @@ def evaluate_angle(
     }
 
 
+# =========================================================
+# SMART OPTIMIZATION ENDPOINT
+# =========================================================
+
 @app.post("/smart-optimize")
 async def smart_optimize(
     file: UploadFile = File(...),
@@ -320,16 +369,16 @@ async def smart_optimize(
     coarse_step: float = 60.0,
     refine_step: float = 15.0,
     sample_points_coarse: int = 1500,
-    sample_points_refine: int = 8000,
-    cluster_eps: float = 2,
+    sample_points_refine: int = 3000,
+    cluster_eps: float = 1.5,
     min_samples: int = 4,
     support_radius: float = 3.0,
     min_height: float = 1.0,
     critical_angle_deg: float = 45.0,
-    max_xy_distance: float = 8.0,
-    typenal_weight: float = 20.0,
-    tree_eps: float = 10.0,
-    min_feasible_coverage: float = 0.3
+    max_xy_distance: float = 6.0,
+    penalty_weight: float = 10.0,
+    tree_eps: float = 18.0,
+    min_feasible_coverage: float = 0.5
 ):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as tmp:
         tmp.write(await file.read())
@@ -357,6 +406,7 @@ async def smart_optimize(
                 tree_eps=tree_eps,
                 min_feasible_coverage=min_feasible_coverage
             )
+
             coarse_results.append(result)
 
         coarse_feasible = [r for r in coarse_results if r["is_feasible"]]
@@ -390,6 +440,7 @@ async def smart_optimize(
                 tree_eps=tree_eps,
                 min_feasible_coverage=min_feasible_coverage
             )
+
             refine_results.append(result)
 
         feasible_results = [r for r in refine_results if r["is_feasible"]]
@@ -421,6 +472,10 @@ async def smart_optimize(
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+
+# =========================================================
+# MESH GENERATION
+# =========================================================
 
 def cylinder_between(p1, p2, radius=3.0, sections=24):
     p1 = np.array(p1, dtype=float)
@@ -459,7 +514,9 @@ def base_plate(x, y, z=0.0, radius=8.0, height=1.0, sections=32):
         height=height,
         sections=sections
     )
+
     plate.apply_translation([x, y, z + height / 2.0])
+
     return plate
 
 
@@ -484,6 +541,7 @@ def classic_support_mesh(supports, add_base=True):
                 radius=s["radius"] * 2.5,
                 height=max(0.8, s["radius"] * 0.3)
             )
+
             meshes.append(plate)
 
     if len(meshes) == 0:
@@ -513,10 +571,10 @@ def tree_support_mesh(tree, add_base=True):
                 radius=t["radius"] * 2.6,
                 height=max(0.8, t["radius"] * 0.35)
             )
+
             meshes.append(plate)
 
     for b in tree["branches"]:
-        # branch iki segmentli: trunk -> mid -> target
         cyl1 = cylinder_between(
             [b["x1"], b["y1"], b["z1"]],
             [b["xm"], b["ym"], b["zm"]],
@@ -541,6 +599,12 @@ def tree_support_mesh(tree, add_base=True):
         return None
 
     return trimesh.util.concatenate(meshes)
+
+
+# =========================================================
+# EXPORT SUPPORT STL ENDPOINT
+# =========================================================
+
 @app.post("/export-support-stl")
 async def export_support_stl(
     file: UploadFile = File(...),
@@ -548,13 +612,15 @@ async def export_support_stl(
     mode: Literal["classic", "tree"] = "classic",
     full_resolution: bool = False,
     export_sample_points: int = 5000,
-    cluster_eps: float = 2,
-    min_samples: int = 4,
-    support_radius: float = 1.0,
-    min_height: float = 1.0,
+    cluster_eps: float = 4.0,
+    min_samples: int = 3,
+    support_radius: float = 3.0,
+    min_height: float = 5.0,
     critical_angle_deg: float = 45.0,
-    tree_eps: float = 10.0,
-    add_base: bool = True
+    tree_eps: float = 18.0,
+    add_base: bool = True,
+    max_branches_per_tree: int = 12,
+    branch_merge_eps: float = 6.0
 ):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as tmp:
         tmp.write(await file.read())
@@ -562,9 +628,11 @@ async def export_support_stl(
 
     try:
         mesh = trimesh.load_mesh(tmp_path)
+
         mesh.apply_transform(rotation_matrix(np.radians(angle), [0, 1, 0]))
 
         overhang_faces = detect_overhang_faces(mesh, critical_angle_deg)
+
         points = face_centers(mesh, overhang_faces)
 
         if len(points) == 0:
@@ -573,7 +641,11 @@ async def export_support_stl(
         if not full_resolution:
             points = downsample_points(points, export_sample_points)
 
-        clustered = cluster_points(points, eps=cluster_eps, min_samples=min_samples)
+        clustered = cluster_points(
+            points,
+            eps=cluster_eps,
+            min_samples=min_samples
+        )
 
         if len(clustered) == 0:
             return {
@@ -588,9 +660,14 @@ async def export_support_stl(
             )
 
             if len(supports) == 0:
-                return {"error": "No classic supports generated. Try decreasing min_height."}
+                return {
+                    "error": "No classic supports generated. Try decreasing min_height."
+                }
 
-            mesh_out = classic_support_mesh(supports, add_base=add_base)
+            mesh_out = classic_support_mesh(
+                supports,
+                add_base=add_base
+            )
 
         else:
             tree = generate_tree_supports(
@@ -598,8 +675,8 @@ async def export_support_stl(
                 radius=support_radius,
                 tree_eps=tree_eps,
                 min_height=min_height,
-                max_branches_per_tree=12,
-                branch_merge_eps=6.0
+                max_branches_per_tree=max_branches_per_tree,
+                branch_merge_eps=branch_merge_eps
             )
 
             if len(tree["trunks"]) == 0 and len(tree["branches"]) == 0:
@@ -607,13 +684,22 @@ async def export_support_stl(
                     "error": "No tree supports generated. Try increasing tree_eps or decreasing min_height."
                 }
 
-            mesh_out = tree_support_mesh(tree, add_base=add_base)
+            mesh_out = tree_support_mesh(
+                tree,
+                add_base=add_base
+            )
 
         if mesh_out is None or len(mesh_out.vertices) == 0:
-            return {"error": "Support mesh could not be generated."}
+            return {
+                "error": "Support mesh could not be generated."
+            }
 
         output_name = f"{mode}_support_{uuid.uuid4().hex[:8]}.stl"
-        output_path = os.path.join(tempfile.gettempdir(), output_name)
+
+        output_path = os.path.join(
+            tempfile.gettempdir(),
+            output_name
+        )
 
         mesh_out.export(output_path)
 
