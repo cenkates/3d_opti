@@ -19,16 +19,16 @@ The enhanced version of your 3D Support Optimizer includes significant improveme
 
 ### 1. Install Dependencies
 ```bash
-pip install -r requirements.txt
+pip install -r requirements_python313.txt
 ```
 
 ### 2. Run the Server
 ```bash
 # Development mode
-python -m uvicorn main_enhanced:app --reload
+python -m uvicorn main:app --reload
 
 # Production mode
-uvicorn main_enhanced:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ### 3. Access the API
@@ -40,12 +40,12 @@ uvicorn main_enhanced:app --host 0.0.0.0 --port 8000
 
 ```
 project/
-├── main_enhanced.py          # Main application (refactored)
-├── config.py                 # Configuration management
-├── requirements.txt          # Python dependencies
-├── test_main_enhanced.py     # Unit tests
-├── ENHANCEMENTS.md          # Detailed enhancement report
-└── README.md                 # This file
+├── main.py                      # Main application (refactored)
+├── config.py                    # Configuration management
+├── requirements_python313.txt   # Python dependencies
+├── test_main_enhanced.py        # Unit tests
+├── ENHANCEMENTS.md              # Detailed enhancement report
+└── README.md                    # This file
 ```
 
 ## API Endpoints
