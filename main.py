@@ -1,5 +1,5 @@
 """
-3D Support Optimizer v9.2 - Goal Programming Collision-Constrained Tree System
+3D Support Optimizer Beta V9.3 - Goal Programming Collision-Constrained Tree System
 Features:
 - FastAPI UI
 - Material/nozzle selection
@@ -86,9 +86,9 @@ class InvalidNozzleError(Exception):
 # =========================================================
 
 app = FastAPI(
-    title="3D Support Optimizer v9.0",
-    description="Full single-file support optimizer with angle scan, physics, and tree support export.",
-    version="9.2.0",
+    title="3D Support Optimizer Beta V9.3",
+    description="Beta V9.3 / V10 logic: goal programming, collision-constrained classic/tree supports, adaptive search.",
+    version="9.3.0-beta",
 )
 
 
@@ -729,6 +729,8 @@ class SupportGenerator:
         tip_gap_mm: float = 0.25,
         ray_clearance_mm: float = 0.8,
         downray_filter: bool = True,
+        max_branch_angle_deg: float = 65.0,
+        min_cluster_points: int = 3,
     ) -> Dict[str, Any]:
         """
         Load-aware tree support.
@@ -783,7 +785,7 @@ class SupportGenerator:
 
         for tree_id in set(labels):
             tree_points = points[labels == tree_id]
-            if len(tree_points) == 0:
+            if len(tree_points) < min_cluster_points:
                 continue
 
             branch_points = GeometryProcessor.cluster_points(
@@ -919,6 +921,19 @@ class SupportGenerator:
                     clearance_mm=ray_clearance_mm,
                     max_attempts=7,
                 )
+
+                # Hard constraint: branch must transfer load mostly downward.
+                if max(
+                    branch_vertical_angle_deg(
+                        [trunk_x, trunk_y, trunk_z_top],
+                        [mid_x, mid_y, mid_z],
+                    ),
+                    branch_vertical_angle_deg(
+                        [mid_x, mid_y, mid_z],
+                        [contact_x, contact_y, contact_z],
+                    ),
+                ) > max_branch_angle_deg:
+                    continue
 
                 # Hard constraint: if the branch tube still intersects the mesh, skip this branch.
                 if curve_hits_mesh(
@@ -1448,13 +1463,25 @@ def build_supports_for_orientation(
     big_m_disconnected: float = BIG_M_DEFAULT,
 ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     if support_type == "classic":
-        supports_list = SupportGenerator.classic_supports(
-            points,
+        supports_list = classic_supports_collision_safe(
+            mesh=mesh,
+            points=points,
             radius=support_radius,
             bed_z=bed_z,
             mesh_mass_g=mesh_mass_g,
+            min_height=1.0,
+            tip_gap_mm=tip_gap_mm,
+            ray_clearance_mm=ray_clearance_mm,
+            downray_filter=downray_filter,
         )
-        return {"trunks": [], "branches": supports_list}, supports_list
+        classic_tree = {"trunks": [], "branches": supports_list}
+        classic_tree["collision_count"] = 0
+        classic_tree["disconnected_count"] = 0
+        classic_tree["target_volume"] = float(target_volume)
+        classic_tree["target_support_count"] = int(target_support_count)
+        classic_tree["big_m_collision"] = float(big_m_collision)
+        classic_tree["big_m_disconnected"] = float(big_m_disconnected)
+        return classic_tree, supports_list
 
     supports = SupportGenerator.load_aware_tree_supports(
         points,
@@ -1476,12 +1503,19 @@ def build_supports_for_orientation(
         tip_gap_mm=tip_gap_mm,
         ray_clearance_mm=ray_clearance_mm,
         downray_filter=downray_filter,
+        max_branch_angle_deg=max_branch_angle_deg,
+        min_cluster_points=min_cluster_points,
+    )
+    supports = prune_unused_trunks(supports)
+    load_path_bad_count = support_tree_has_valid_load_paths(
+        supports,
+        max_branch_angle_deg=max_branch_angle_deg,
     )
     supports["collision_count"] = collision_count_for_tree(
         supports,
         mesh,
         clearance_mm=ray_clearance_mm,
-    )
+    ) + load_path_bad_count
     supports["disconnected_count"] = disconnected_count_for_tree(supports)
     supports["target_volume"] = float(target_volume)
     supports["target_support_count"] = int(target_support_count)
@@ -1518,6 +1552,8 @@ def evaluate_orientation(
     target_support_count: int,
     big_m_collision: float,
     big_m_disconnected: float,
+    max_branch_angle_deg: float,
+    min_cluster_points: int,
 ) -> AngleScanResult:
     try:
         mesh, points, bed_z = GeometryProcessor.process_rotated_mesh(
@@ -1552,6 +1588,8 @@ def evaluate_orientation(
             target_support_count,
             big_m_collision,
             big_m_disconnected,
+            max_branch_angle_deg,
+            min_cluster_points,
         )
 
         feasibility = PhysicsMotor.assess_support_feasibility(
@@ -1672,6 +1710,8 @@ def adaptive_scan_orientations(
     target_support_count: int,
     big_m_collision: float,
     big_m_disconnected: float,
+    max_branch_angle_deg: float,
+    min_cluster_points: int,
     initial_step: float = 60.0,
     min_step: float = 1.0,
     top_k: int = 2,
@@ -1724,6 +1764,8 @@ def adaptive_scan_orientations(
             target_support_count=target_support_count,
             big_m_collision=big_m_collision,
             big_m_disconnected=big_m_disconnected,
+            max_branch_angle_deg=max_branch_angle_deg,
+            min_cluster_points=min_cluster_points,
         )
 
     # Coarse grid. Include theta=90 even if step is 60.
@@ -1768,6 +1810,131 @@ def adaptive_scan_orientations(
     return list(evaluated.values())
 
 
+
+# =========================================================
+# BETA V9.3 / V10 SUPPORT TOPOLOGY HELPERS
+# =========================================================
+
+def branch_vertical_angle_deg(p0, p1) -> float:
+    """
+    Angle between branch direction and vertical axis.
+    0° = vertical, 90° = horizontal.
+    """
+    p0 = np.array(p0, dtype=float)
+    p1 = np.array(p1, dtype=float)
+    v = p1 - p0
+    n = float(np.linalg.norm(v))
+    if n < 1e-9:
+        return 90.0
+    v = v / n
+    vertical = np.array([0.0, 0.0, 1.0])
+    return float(np.degrees(np.arccos(np.clip(abs(np.dot(v, vertical)), -1.0, 1.0))))
+
+
+def prune_unused_trunks(tree: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove trunks with no branches. This fixes disconnected lonely pillars.
+    """
+    trunks = tree.get("trunks", [])
+    branches = tree.get("branches", [])
+
+    used_ids = set(int(b.get("trunk_id", -999)) for b in branches)
+    kept_trunks = [t for t in trunks if int(t.get("id", -999)) in used_ids]
+
+    old_to_new = {}
+    for new_id, t in enumerate(kept_trunks):
+        old_id = int(t.get("id", new_id))
+        old_to_new[old_id] = new_id
+        t["id"] = int(new_id)
+
+    kept_branches = []
+    for b in branches:
+        old_id = int(b.get("trunk_id", -999))
+        if old_id in old_to_new:
+            b["trunk_id"] = int(old_to_new[old_id])
+            kept_branches.append(b)
+
+    tree["trunks"] = kept_trunks
+    tree["branches"] = kept_branches
+    return tree
+
+
+def classic_supports_collision_safe(
+    mesh: trimesh.Trimesh,
+    points: np.ndarray,
+    radius: float,
+    bed_z: float,
+    mesh_mass_g: float,
+    min_height: float = 1.0,
+    tip_gap_mm: float = 0.25,
+    ray_clearance_mm: float = 0.8,
+    downray_filter: bool = True,
+) -> List[Dict[str, float]]:
+    """
+    Classic support with forbidden-zone logic:
+    - optionally downray filters points
+    - skips pillars whose centerline intersects mesh before the contact point
+    """
+    if downray_filter:
+        points = filter_points_needing_support_by_downray(
+            mesh,
+            points,
+            bed_z=bed_z,
+            min_drop_mm=min_height,
+            surface_offset_mm=0.35,
+        )
+
+    if len(points) == 0:
+        return []
+
+    supports = []
+    point_load = StructuralAnalyzer.estimate_point_load_n(mesh_mass_g, len(points))
+
+    for p in points:
+        x, y, z = float(p[0]), float(p[1]), float(p[2])
+        z_top = z - tip_gap_mm
+        height = z_top - bed_z
+        if height <= min_height:
+            continue
+
+        # Check centerline collision. Clearance approximates tube radius.
+        p0 = [x, y, bed_z + 0.35]
+        p1 = [x, y, z_top - 0.35]
+        if ray_hits_mesh_between(
+            mesh,
+            p0,
+            p1,
+            clearance_mm=ray_clearance_mm + radius,
+        ):
+            continue
+
+        supports.append({
+            "x": x,
+            "y": y,
+            "z_bottom": float(bed_z),
+            "z_top": float(z_top),
+            "radius": float(radius),
+            "height": float(height),
+            "length": float(height),
+            "force_n": float(point_load),
+        })
+
+    return supports
+
+
+def support_tree_has_valid_load_paths(tree: Dict[str, Any], max_branch_angle_deg: float = 65.0) -> int:
+    """
+    Count branches that are too horizontal to be physically reasonable.
+    """
+    bad = 0
+    for b in tree.get("branches", []):
+        a1 = branch_vertical_angle_deg([b["x1"], b["y1"], b["z1"]], [b["xm"], b["ym"], b["zm"]])
+        a2 = branch_vertical_angle_deg([b["xm"], b["ym"], b["zm"]], [b["x2"], b["y2"], b["z2"]])
+        if max(a1, a2) > max_branch_angle_deg:
+            bad += 1
+    return int(bad)
+
+
 # =========================================================
 # API ROUTES
 # =========================================================
@@ -1794,6 +1961,13 @@ def health_check():
         "support_types": [x.value for x in SupportType],
         "ray_engine": "pyembree/embreex if installed, otherwise trimesh native",
         "objective": "weighted nonlinear goal programming with Big-M collision/connectivity penalties",
+        "beta_v9_3_features": [
+            "classic support forbidden-zone collision filter",
+            "tree branch maximum angle constraint",
+            "unused trunk pruning",
+            "cluster minimum point threshold",
+            "hard coverage and collision goals"
+        ],
     }
 
 
@@ -1830,6 +2004,8 @@ async def analyze_all_orientations(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
+    max_branch_angle_deg: float = 65.0,
+    min_cluster_points: int = 3,
 ):
     try:
         nozzle_mm = validate_nozzle(nozzle_mm)
@@ -1871,6 +2047,8 @@ async def analyze_all_orientations(
                     target_support_count=target_support_count,
                     big_m_collision=big_m_collision,
                     big_m_disconnected=big_m_disconnected,
+                    max_branch_angle_deg=max_branch_angle_deg,
+                    min_cluster_points=min_cluster_points,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -1910,6 +2088,8 @@ async def analyze_all_orientations(
                             target_support_count=target_support_count,
                             big_m_collision=big_m_collision,
                             big_m_disconnected=big_m_disconnected,
+                            max_branch_angle_deg=max_branch_angle_deg,
+                            min_cluster_points=min_cluster_points,
                         )
                         all_results.append(result)
 
@@ -1952,6 +2132,8 @@ async def analyze_all_orientations(
                     "target_support_count": int(target_support_count),
                     "big_m_collision": float(big_m_collision),
                     "big_m_disconnected": float(big_m_disconnected),
+                    "max_branch_angle_deg": float(max_branch_angle_deg),
+                    "min_cluster_points": int(min_cluster_points),
                 },
                 "summary": {
                     "total_orientations_tested": len(all_results),
@@ -2059,6 +2241,8 @@ async def generate_and_export(
                     target_support_count=target_support_count,
                     big_m_collision=big_m_collision,
                     big_m_disconnected=big_m_disconnected,
+                    max_branch_angle_deg=max_branch_angle_deg,
+                    min_cluster_points=min_cluster_points,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -2098,6 +2282,8 @@ async def generate_and_export(
                             target_support_count=target_support_count,
                             big_m_collision=big_m_collision,
                             big_m_disconnected=big_m_disconnected,
+                            max_branch_angle_deg=max_branch_angle_deg,
+                            min_cluster_points=min_cluster_points,
                         )
                         all_results.append(result)
 
@@ -2154,6 +2340,8 @@ async def generate_and_export(
                 target_support_count=target_support_count,
                 big_m_collision=big_m_collision,
                 big_m_disconnected=big_m_disconnected,
+                max_branch_angle_deg=max_branch_angle_deg,
+                min_cluster_points=min_cluster_points,
             )
 
             if support_type == "classic":
