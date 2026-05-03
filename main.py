@@ -1,5 +1,5 @@
 """
-3D Support Optimizer v8.0 - Collision-Aware Tapered Tree System
+3D Support Optimizer v9.2 - Goal Programming Collision-Constrained Tree System
 Features:
 - FastAPI UI
 - Material/nozzle selection
@@ -86,9 +86,9 @@ class InvalidNozzleError(Exception):
 # =========================================================
 
 app = FastAPI(
-    title="3D Support Optimizer v8.0",
+    title="3D Support Optimizer v9.0",
     description="Full single-file support optimizer with angle scan, physics, and tree support export.",
-    version="8.0.0",
+    version="9.2.0",
 )
 
 
@@ -238,6 +238,279 @@ def make_safe_branch_control_point(
 def approximate_bezier_length(p0, p1, p2, samples: int = 10) -> float:
     pts = [bezier_quad(p0, p1, p2, t) for t in np.linspace(0, 1, samples)]
     return float(sum(np.linalg.norm(pts[i + 1] - pts[i]) for i in range(len(pts) - 1)))
+
+
+
+
+# =========================================================
+# FAST RAY ENGINE - V9.1
+# =========================================================
+
+_FAST_RAY_CACHE = {}
+
+
+def get_fast_ray_engine(mesh: Optional[trimesh.Trimesh]):
+    """
+    Use pyembree/Embree ray intersector when installed.
+    Fallback to mesh.ray otherwise.
+    """
+    if mesh is None:
+        return None
+
+    key = id(mesh)
+    if key in _FAST_RAY_CACHE:
+        return _FAST_RAY_CACHE[key]
+
+    try:
+        from trimesh.ray.ray_pyembree import RayMeshIntersector
+        engine = RayMeshIntersector(mesh)
+        _FAST_RAY_CACHE[key] = engine
+        return engine
+    except Exception:
+        engine = mesh.ray
+        _FAST_RAY_CACHE[key] = engine
+        return engine
+
+
+def ray_intersects_location_fast(mesh: Optional[trimesh.Trimesh], origins, directions, multiple_hits: bool = True):
+    engine = get_fast_ray_engine(mesh)
+    if engine is None:
+        return [], [], []
+
+    return engine.intersects_location(
+        ray_origins=origins,
+        ray_directions=directions,
+        multiple_hits=multiple_hits
+    )
+
+
+# =========================================================
+# RAYCAST COLLISION HELPERS - V9
+# =========================================================
+
+def ray_hits_mesh_between(mesh: Optional[trimesh.Trimesh], p0, p1, clearance_mm: float = 0.8) -> bool:
+    """
+    Return True if segment p0->p1 intersects the model before reaching target.
+    If trimesh ray backend is unavailable, it safely returns False.
+    """
+    if mesh is None:
+        return False
+    p0 = np.array(p0, dtype=float)
+    p1 = np.array(p1, dtype=float)
+    vec = p1 - p0
+    length = float(np.linalg.norm(vec))
+    if length < 1e-6:
+        return False
+    direction = vec / length
+    origin = p0 + direction * clearance_mm
+    try:
+        locations, _, _ = ray_intersects_location_fast(
+            mesh,
+            origins=[origin],
+            directions=[direction],
+            multiple_hits=True
+        )
+    except Exception:
+        return False
+    for loc in locations:
+        dist = float(np.linalg.norm(loc - origin))
+        if clearance_mm < dist < length - clearance_mm:
+            return True
+    return False
+
+
+def curve_hits_mesh(mesh: Optional[trimesh.Trimesh], p0, p1, p2, clearance_mm: float = 0.8, samples: int = 8) -> bool:
+    if mesh is None:
+        return False
+    pts = [bezier_quad(p0, p1, p2, t) for t in np.linspace(0, 1, samples)]
+    for i in range(len(pts) - 1):
+        if ray_hits_mesh_between(mesh, pts[i], pts[i + 1], clearance_mm=clearance_mm):
+            return True
+    return False
+
+
+def find_safe_control_point(
+    mesh: Optional[trimesh.Trimesh],
+    trunk_xyz,
+    target_xyz,
+    center_x: float,
+    center_y: float,
+    mesh_bounds: Optional[np.ndarray],
+    base_outside_offset: float,
+    curve_lift: float,
+    collision_margin: float,
+    clearance_mm: float,
+    max_attempts: int = 7,
+):
+    """
+    Try larger outward/lifted Bezier control points until the branch curve
+    is not intersecting the mesh.
+    """
+    tx, ty, tz = trunk_xyz
+    px, py, pz = target_xyz
+    ux, uy = outward_unit_from_center(px, py, center_x, center_y)
+    best = None
+
+    for attempt in range(max_attempts):
+        factor = 1.0 + attempt * 0.45
+        mx = (tx + px) / 2.0 + ux * base_outside_offset * factor
+        my = (ty + py) / 2.0 + uy * base_outside_offset * factor
+        mz = tz + (pz - tz) * 0.55 + curve_lift * factor
+
+        mx, my = push_point_outside_xy_bbox(
+            mx, my, center_x, center_y, mesh_bounds, margin=collision_margin * factor
+        )
+        control = (float(mx), float(my), float(mz))
+        best = control
+
+        if not curve_hits_mesh(mesh, trunk_xyz, control, target_xyz, clearance_mm=clearance_mm, samples=9):
+            return control
+
+    return best
+
+
+def filter_points_needing_support_by_downray(
+    mesh: Optional[trimesh.Trimesh],
+    points: np.ndarray,
+    bed_z: float,
+    min_drop_mm: float = 1.0,
+    surface_offset_mm: float = 0.35,
+) -> np.ndarray:
+    """
+    Keep points where a vertical downward ray reaches the build plate without
+    hitting the model. This removes many internal/self-supported points.
+    """
+    if mesh is None or len(points) == 0:
+        return points
+
+    origins = points + np.array([0.0, 0.0, surface_offset_mm])
+    directions = np.tile(np.array([0.0, 0.0, -1.0]), (len(points), 1))
+
+    try:
+        locations, index_ray, _ = ray_intersects_location_fast(
+            mesh,
+            origins=origins,
+            directions=directions,
+            multiple_hits=True
+        )
+    except Exception:
+        return points
+
+    ray_to_hits = {}
+    for loc, ridx in zip(locations, index_ray):
+        ray_to_hits.setdefault(int(ridx), []).append(loc)
+
+    keep = []
+    for i, p in enumerate(points):
+        if float(p[2] - bed_z) <= min_drop_mm:
+            continue
+
+        hits = ray_to_hits.get(i, [])
+        real_hits = []
+        for h in hits:
+            dz = float(origins[i][2] - h[2])
+            if dz > surface_offset_mm + 0.8:
+                real_hits.append(h)
+
+        if len(real_hits) == 0:
+            keep.append(p)
+
+    if len(keep) == 0:
+        return points
+    return np.array(keep)
+
+
+
+# =========================================================
+# GOAL PROGRAMMING + COLLISION HELPERS - V9.2
+# =========================================================
+
+BIG_M_DEFAULT = 1_000_000.0
+
+
+def goal_programming_objective(
+    coverage: float,
+    volume: float,
+    support_count: int,
+    collision_count: int,
+    disconnected_count: int,
+    target_coverage: float = 0.35,
+    target_volume: float = 180000.0,
+    target_support_count: int = 180,
+    w_coverage: float = 1000.0,
+    w_volume: float = 0.002,
+    w_support_count: float = 2.0,
+    big_m_collision: float = BIG_M_DEFAULT,
+    big_m_disconnected: float = BIG_M_DEFAULT,
+) -> Dict[str, Any]:
+    d_coverage_under = max(0.0, target_coverage - float(coverage))
+    d_volume_over = max(0.0, float(volume) - float(target_volume))
+    d_support_over = max(0.0, float(support_count) - float(target_support_count))
+
+    z = (
+        w_coverage * d_coverage_under
+        + w_volume * d_volume_over
+        + big_m_collision * float(collision_count)
+        + big_m_disconnected * float(disconnected_count)
+        + w_support_count * d_support_over
+    )
+
+    return {
+        "Z": float(z),
+        "deviations": {
+            "d_coverage_under": float(d_coverage_under),
+            "d_volume_over": float(d_volume_over),
+            "d_collision": int(collision_count),
+            "d_disconnected": int(disconnected_count),
+            "d_support_over": float(d_support_over),
+        },
+        "targets": {
+            "target_coverage": float(target_coverage),
+            "target_volume": float(target_volume),
+            "target_support_count": int(target_support_count),
+        },
+        "weights": {
+            "w_coverage": float(w_coverage),
+            "w_volume": float(w_volume),
+            "w_support_count": float(w_support_count),
+            "big_m_collision": float(big_m_collision),
+            "big_m_disconnected": float(big_m_disconnected),
+        },
+    }
+
+
+def collision_count_for_tree(tree: Dict[str, Any], mesh: Optional[trimesh.Trimesh], clearance_mm: float = 1.0) -> int:
+    if mesh is None:
+        return 0
+    count = 0
+    for b in tree.get("branches", []):
+        p0 = [b["x1"], b["y1"], b["z1"]]
+        p1 = [b["xm"], b["ym"], b["zm"]]
+        p2 = [b["x2"], b["y2"], b["z2"]]
+        radius = float(b.get("radius", 1.0))
+        if curve_hits_mesh(mesh, p0, p1, p2, clearance_mm=clearance_mm + radius, samples=9):
+            count += 1
+    return int(count)
+
+
+def disconnected_count_for_tree(tree: Dict[str, Any]) -> int:
+    trunks = tree.get("trunks", [])
+    valid = set(int(t.get("id", -999)) for t in trunks)
+    disconnected = 0
+    for b in tree.get("branches", []):
+        if int(b.get("trunk_id", -999)) not in valid:
+            disconnected += 1
+    return int(disconnected)
+
+
+def contact_point_with_normal_offset(surface_point, center_x: float, center_y: float, tip_gap_mm: float):
+    px, py, pz = float(surface_point[0]), float(surface_point[1]), float(surface_point[2])
+    ux, uy = outward_unit_from_center(px, py, center_x, center_y)
+    n = np.array([ux, uy, 0.35], dtype=float)
+    nn = np.linalg.norm(n)
+    n = np.array([0.0, 0.0, 1.0]) if nn < 1e-9 else n / nn
+    c = np.array([px, py, pz], dtype=float) + n * float(tip_gap_mm)
+    return float(c[0]), float(c[1]), float(c[2])
 
 
 # =========================================================
@@ -451,8 +724,11 @@ class SupportGenerator:
         branch_outside_offset: float = 25.0,
         branch_curve_lift: float = 5.0,
         mesh_bounds: Optional[np.ndarray] = None,
+        mesh_for_raycast: Optional[trimesh.Trimesh] = None,
         collision_margin: float = 8.0,
         tip_gap_mm: float = 0.25,
+        ray_clearance_mm: float = 0.8,
+        downray_filter: bool = True,
     ) -> Dict[str, Any]:
         """
         Load-aware tree support.
@@ -473,6 +749,27 @@ class SupportGenerator:
             }
 
         validate_nozzle(nozzle_mm)
+
+        if downray_filter:
+            points = filter_points_needing_support_by_downray(
+                mesh_for_raycast,
+                points,
+                bed_z=bed_z,
+                min_drop_mm=min_height,
+                surface_offset_mm=0.35,
+            )
+
+        if len(points) == 0:
+            return {
+                "trunks": [],
+                "branches": [],
+                "physics": {
+                    "all_ok": False,
+                    "reason": "No free overhang points after down-ray filter",
+                    "trunk_count": 0,
+                    "branch_count": 0,
+                }
+            }
 
         labels = DBSCAN(eps=tree_eps, min_samples=1).fit(points[:, :2]).labels_
         trunks = []
@@ -599,28 +896,46 @@ class SupportGenerator:
                     dir_bx /= norm_b
                     dir_by /= norm_b
 
-                # Contact should touch just below the overhang point, not pass into the model.
-                contact_x = px
-                contact_y = py
-                contact_z = pz - tip_gap_mm
+                # V9.2: offset contact along approximate outward surface normal.
+                contact_x, contact_y, contact_z = contact_point_with_normal_offset(
+                    (px, py, pz),
+                    center_x,
+                    center_y,
+                    tip_gap_mm,
+                )
 
                 # Curved branch control point is forced outside the model footprint.
-                mid_x, mid_y, mid_z = make_safe_branch_control_point(
+                # V9: raycast-tested and pushed outward/lifted until it avoids the model.
+                mid_x, mid_y, mid_z = find_safe_control_point(
+                    mesh_for_raycast,
                     (trunk_x, trunk_y, trunk_z_top),
                     (contact_x, contact_y, contact_z),
                     center_x,
                     center_y,
                     mesh_bounds,
-                    outside_offset=branch_outside_offset,
+                    base_outside_offset=branch_outside_offset,
                     curve_lift=branch_curve_lift,
                     collision_margin=collision_margin,
+                    clearance_mm=ray_clearance_mm,
+                    max_attempts=7,
                 )
+
+                # Hard constraint: if the branch tube still intersects the mesh, skip this branch.
+                if curve_hits_mesh(
+                    mesh_for_raycast,
+                    [trunk_x, trunk_y, trunk_z_top],
+                    [mid_x, mid_y, mid_z],
+                    [contact_x, contact_y, contact_z],
+                    clearance_mm=ray_clearance_mm + max(0.6, radius * 0.35),
+                    samples=10,
+                ):
+                    continue
 
                 branch_length = approximate_bezier_length(
                     [trunk_x, trunk_y, trunk_z_top],
                     [mid_x, mid_y, mid_z],
                     [contact_x, contact_y, contact_z],
-                    samples=10,
+                    samples=12,
                 )
 
                 branch_force = point_load
@@ -856,20 +1171,32 @@ class PhysicsMotor:
         coverage = PhysicsMotor.calculate_coverage(overhang_points, supports, max_xy_distance)
         volume = PhysicsMotor.calculate_support_volume(supports)
 
-        score = PhysicsMotor.calculate_feasibility_score(
-            volume=volume,
+        support_count_total = len(trunks) + len(branches)
+        collision_count = int(supports.get("collision_count", 0))
+        disconnected_count = int(supports.get("disconnected_count", disconnected_count_for_tree(supports)))
+
+        gp = goal_programming_objective(
             coverage=coverage,
-            compression_ok=all_compression_ok,
-            buckling_ok=all_buckling_ok,
-            support_count=len(trunks) + len(branches),
-            min_coverage=min_coverage,
+            volume=volume,
+            support_count=support_count_total,
+            collision_count=collision_count,
+            disconnected_count=disconnected_count,
+            target_coverage=min_coverage,
+            target_volume=float(supports.get("target_volume", 180000.0)),
+            target_support_count=int(supports.get("target_support_count", 180)),
+            big_m_collision=float(supports.get("big_m_collision", BIG_M_DEFAULT)),
+            big_m_disconnected=float(supports.get("big_m_disconnected", BIG_M_DEFAULT)),
         )
+
+        score = -float(gp["Z"])
 
         is_feasible = (
             all_compression_ok
             and all_buckling_ok
             and coverage >= min_coverage
-            and (len(trunks) + len(branches) > 0)
+            and support_count_total > 0
+            and collision_count == 0
+            and disconnected_count == 0
         )
 
         return {
@@ -893,17 +1220,23 @@ class PhysicsMotor:
             "score": {
                 "value": float(score),
                 "status": "acceptable" if is_feasible else "unacceptable",
+                "goal_programming": gp,
                 "details": {
-                    "volume_penalty": float(volume * 0.003),
-                    "support_penalty": float((len(trunks) + len(branches)) * 0.8),
-                    "coverage_penalty": float(max(0.0, min_coverage - coverage) * 2000.0),
+                    "objective_Z_minimize": float(gp["Z"]),
+                    "volume_penalty": float(gp["deviations"]["d_volume_over"] * gp["weights"]["w_volume"]),
+                    "support_penalty": float(gp["deviations"]["d_support_over"] * gp["weights"]["w_support_count"]),
+                    "coverage_penalty": float(gp["deviations"]["d_coverage_under"] * gp["weights"]["w_coverage"]),
+                    "collision_penalty": float(gp["deviations"]["d_collision"] * gp["weights"]["big_m_collision"]),
+                    "disconnected_penalty": float(gp["deviations"]["d_disconnected"] * gp["weights"]["big_m_disconnected"]),
                     "physics_penalty": 0 if (all_compression_ok and all_buckling_ok) else 100000,
                 },
             },
             "support_structure": {
                 "trunk_count": len(trunks),
                 "branch_count": len(branches),
-                "total_count": len(trunks) + len(branches),
+                "total_count": support_count_total,
+                "collision_count": collision_count,
+                "disconnected_count": disconnected_count,
             },
         }
 
@@ -1105,8 +1438,14 @@ def build_supports_for_orientation(
     trunk_outside_offset: float,
     branch_outside_offset: float,
     branch_curve_lift: float,
-    collision_margin: float,
-    tip_gap_mm: float,
+    collision_margin: float = 10.0,
+    tip_gap_mm: float = 0.25,
+    ray_clearance_mm: float = 0.8,
+    downray_filter: bool = True,
+    target_volume: float = 180000.0,
+    target_support_count: int = 180,
+    big_m_collision: float = BIG_M_DEFAULT,
+    big_m_disconnected: float = BIG_M_DEFAULT,
 ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     if support_type == "classic":
         supports_list = SupportGenerator.classic_supports(
@@ -1132,9 +1471,22 @@ def build_supports_for_orientation(
         branch_outside_offset=branch_outside_offset,
         branch_curve_lift=branch_curve_lift,
         mesh_bounds=mesh.bounds,
+        mesh_for_raycast=mesh,
         collision_margin=collision_margin,
         tip_gap_mm=tip_gap_mm,
+        ray_clearance_mm=ray_clearance_mm,
+        downray_filter=downray_filter,
     )
+    supports["collision_count"] = collision_count_for_tree(
+        supports,
+        mesh,
+        clearance_mm=ray_clearance_mm,
+    )
+    supports["disconnected_count"] = disconnected_count_for_tree(supports)
+    supports["target_volume"] = float(target_volume)
+    supports["target_support_count"] = int(target_support_count)
+    supports["big_m_collision"] = float(big_m_collision)
+    supports["big_m_disconnected"] = float(big_m_disconnected)
     return supports, None
 
 
@@ -1160,6 +1512,12 @@ def evaluate_orientation(
     branch_curve_lift: float,
     collision_margin: float,
     tip_gap_mm: float,
+    ray_clearance_mm: float,
+    downray_filter: bool,
+    target_volume: float,
+    target_support_count: int,
+    big_m_collision: float,
+    big_m_disconnected: float,
 ) -> AngleScanResult:
     try:
         mesh, points, bed_z = GeometryProcessor.process_rotated_mesh(
@@ -1188,6 +1546,12 @@ def evaluate_orientation(
             branch_curve_lift,
             collision_margin,
             tip_gap_mm,
+            ray_clearance_mm,
+            downray_filter,
+            target_volume,
+            target_support_count,
+            big_m_collision,
+            big_m_disconnected,
         )
 
         feasibility = PhysicsMotor.assess_support_feasibility(
@@ -1302,6 +1666,12 @@ def adaptive_scan_orientations(
     branch_curve_lift: float,
     collision_margin: float,
     tip_gap_mm: float,
+    ray_clearance_mm: float,
+    downray_filter: bool,
+    target_volume: float,
+    target_support_count: int,
+    big_m_collision: float,
+    big_m_disconnected: float,
     initial_step: float = 60.0,
     min_step: float = 1.0,
     top_k: int = 2,
@@ -1348,6 +1718,12 @@ def adaptive_scan_orientations(
             branch_curve_lift=branch_curve_lift,
             collision_margin=collision_margin,
             tip_gap_mm=tip_gap_mm,
+            ray_clearance_mm=ray_clearance_mm,
+            downray_filter=downray_filter,
+            target_volume=target_volume,
+            target_support_count=target_support_count,
+            big_m_collision=big_m_collision,
+            big_m_disconnected=big_m_disconnected,
         )
 
     # Coarse grid. Include theta=90 even if step is 60.
@@ -1416,6 +1792,8 @@ def health_check():
         "supported_materials": list(MATERIALS.keys()),
         "supported_nozzles": ALLOWED_NOZZLES,
         "support_types": [x.value for x in SupportType],
+        "ray_engine": "pyembree/embreex if installed, otherwise trimesh native",
+        "objective": "weighted nonlinear goal programming with Big-M collision/connectivity penalties",
     }
 
 
@@ -1446,6 +1824,12 @@ async def analyze_all_orientations(
     branch_curve_lift: float = 8.0,
     collision_margin: float = 10.0,
     tip_gap_mm: float = 0.25,
+    ray_clearance_mm: float = 0.8,
+    downray_filter: bool = True,
+    target_volume: float = 180000.0,
+    target_support_count: int = 180,
+    big_m_collision: float = BIG_M_DEFAULT,
+    big_m_disconnected: float = BIG_M_DEFAULT,
 ):
     try:
         nozzle_mm = validate_nozzle(nozzle_mm)
@@ -1481,6 +1865,12 @@ async def analyze_all_orientations(
                     branch_curve_lift=branch_curve_lift,
                     collision_margin=collision_margin,
                     tip_gap_mm=tip_gap_mm,
+                    ray_clearance_mm=ray_clearance_mm,
+                    downray_filter=downray_filter,
+                    target_volume=target_volume,
+                    target_support_count=target_support_count,
+                    big_m_collision=big_m_collision,
+                    big_m_disconnected=big_m_disconnected,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -1514,6 +1904,12 @@ async def analyze_all_orientations(
                             branch_curve_lift=branch_curve_lift,
                             collision_margin=collision_margin,
                             tip_gap_mm=tip_gap_mm,
+                            ray_clearance_mm=ray_clearance_mm,
+                            downray_filter=downray_filter,
+                            target_volume=target_volume,
+                            target_support_count=target_support_count,
+                            big_m_collision=big_m_collision,
+                            big_m_disconnected=big_m_disconnected,
                         )
                         all_results.append(result)
 
@@ -1550,6 +1946,12 @@ async def analyze_all_orientations(
                     "branch_merge_eps": float(branch_merge_eps),
                     "collision_margin": float(collision_margin),
                     "tip_gap_mm": float(tip_gap_mm),
+                    "ray_clearance_mm": float(ray_clearance_mm),
+                    "downray_filter": bool(downray_filter),
+                    "target_volume": float(target_volume),
+                    "target_support_count": int(target_support_count),
+                    "big_m_collision": float(big_m_collision),
+                    "big_m_disconnected": float(big_m_disconnected),
                 },
                 "summary": {
                     "total_orientations_tested": len(all_results),
@@ -1608,6 +2010,12 @@ async def generate_and_export(
     branch_curve_lift: float = 8.0,
     collision_margin: float = 10.0,
     tip_gap_mm: float = 0.25,
+    ray_clearance_mm: float = 0.8,
+    downray_filter: bool = True,
+    target_volume: float = 180000.0,
+    target_support_count: int = 180,
+    big_m_collision: float = BIG_M_DEFAULT,
+    big_m_disconnected: float = BIG_M_DEFAULT,
     smooth_branches: bool = True,
     export_even_if_infeasible: bool = True,
 ):
@@ -1645,6 +2053,12 @@ async def generate_and_export(
                     branch_curve_lift=branch_curve_lift,
                     collision_margin=collision_margin,
                     tip_gap_mm=tip_gap_mm,
+                    ray_clearance_mm=ray_clearance_mm,
+                    downray_filter=downray_filter,
+                    target_volume=target_volume,
+                    target_support_count=target_support_count,
+                    big_m_collision=big_m_collision,
+                    big_m_disconnected=big_m_disconnected,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -1678,6 +2092,12 @@ async def generate_and_export(
                             branch_curve_lift=branch_curve_lift,
                             collision_margin=collision_margin,
                             tip_gap_mm=tip_gap_mm,
+                            ray_clearance_mm=ray_clearance_mm,
+                            downray_filter=downray_filter,
+                            target_volume=target_volume,
+                            target_support_count=target_support_count,
+                            big_m_collision=big_m_collision,
+                            big_m_disconnected=big_m_disconnected,
                         )
                         all_results.append(result)
 
@@ -1728,6 +2148,12 @@ async def generate_and_export(
                 branch_curve_lift=branch_curve_lift,
                 collision_margin=collision_margin,
                 tip_gap_mm=tip_gap_mm,
+                ray_clearance_mm=ray_clearance_mm,
+                downray_filter=downray_filter,
+                target_volume=target_volume,
+                target_support_count=target_support_count,
+                big_m_collision=big_m_collision,
+                big_m_disconnected=big_m_disconnected,
             )
 
             if support_type == "classic":
