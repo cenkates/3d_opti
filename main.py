@@ -86,9 +86,9 @@ class InvalidNozzleError(Exception):
 # =========================================================
 
 app = FastAPI(
-    title="3D Support Optimizer Beta V10.1 Tree Engine",
-    description="Beta V10.1: grouped Cura-style tree engine with trunk grouping, branch merge, interface layer, collision constraints, and goal programming.",
-    version="10.1.0-beta",
+    title="3D Support Optimizer Beta V11.5 Collision Pruning",
+    description="Beta V11.5: print-logic tree engine with collision-pruning, forced 0/0 orientation refinement, explicit infeasibility diagnostics, tapered supports, goal programming, and STL support export.",
+    version="11.5.0-beta",
 )
 
 
@@ -729,7 +729,7 @@ class SupportGenerator:
         tip_gap_mm: float = 0.25,
         ray_clearance_mm: float = 0.8,
         downray_filter: bool = True,
-        max_branch_angle_deg: float = 80.0,
+        max_branch_angle_deg: float = 70.0,
         min_cluster_points: int = 3,
     ) -> Dict[str, Any]:
         """
@@ -1183,7 +1183,7 @@ class PhysicsMotor:
                 "ok": ok,
             })
 
-        coverage = PhysicsMotor.calculate_coverage(overhang_points, supports, max_xy_distance)
+        coverage = coverage_v10(overhang_points, supports, max_xy_distance)
         volume = PhysicsMotor.calculate_support_volume(supports)
 
         support_count_total = len(trunks) + len(branches)
@@ -1252,6 +1252,8 @@ class PhysicsMotor:
                 "total_count": support_count_total,
                 "collision_count": collision_count,
                 "disconnected_count": disconnected_count,
+                "pruned_branches": int(supports.get("pruning", {}).get("pruned_branches", 0)),
+                "pruned_trunks": int(supports.get("pruning", {}).get("pruned_trunks", 0)),
             },
         }
 
@@ -1418,9 +1420,35 @@ class AngleScanResult:
     compression_ok: bool
     buckling_ok: bool
     support_count: int
+    collision_count: int = 0
+    disconnected_count: int = 0
+    pruned_branches: int = 0
+    pruned_trunks: int = 0
+    coverage_ok: bool = False
+    reason: str = ""
     error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        physics_ok = bool(self.compression_ok and self.buckling_ok)
+        collision_ok = int(self.collision_count) == 0
+        disconnected_ok = int(self.disconnected_count) == 0
+        support_ok = int(self.support_count) > 0
+
+        reason = self.reason
+        if not reason:
+            reasons = []
+            if not self.coverage_ok:
+                reasons.append("coverage_below_minimum")
+            if not collision_ok:
+                reasons.append("support_mesh_collision")
+            if not disconnected_ok:
+                reasons.append("disconnected_support_graph")
+            if not physics_ok:
+                reasons.append("physics_failure")
+            if not support_ok:
+                reasons.append("no_support_generated")
+            reason = ", ".join(reasons) if reasons else "feasible"
+
         return {
             "rho": self.rho,
             "theta": self.theta,
@@ -1435,9 +1463,20 @@ class AngleScanResult:
                 "compression_ok": self.compression_ok,
                 "buckling_ok": self.buckling_ok,
             },
+            "constraints": {
+                "coverage_ok": bool(self.coverage_ok),
+                "collision_count": int(self.collision_count),
+                "collision_ok": bool(collision_ok),
+                "disconnected_count": int(self.disconnected_count),
+                "disconnected_ok": bool(disconnected_ok),
+                "pruned_branches": int(self.pruned_branches),
+                "pruned_trunks": int(self.pruned_trunks),
+                "physics_ok": bool(physics_ok),
+                "support_ok": bool(support_ok),
+                "reason": reason,
+            },
             "error": self.error,
         }
-
 
 def build_supports_for_orientation(
     mesh: trimesh.Trimesh,
@@ -1463,7 +1502,7 @@ def build_supports_for_orientation(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
-    max_branch_angle_deg: float = 80.0,
+    max_branch_angle_deg: float = 70.0,
     min_cluster_points: int = 3,
     auto_density: bool = True,
     density_grid_size: float = 6.0,
@@ -1471,10 +1510,14 @@ def build_supports_for_orientation(
     max_density_supports: int = 160,
     density_target_coverage: float = 0.15,
     support_strategy: str = "pro",
-    pro_grid_size: float = 10.0,
+    pro_grid_size: float = 8.0,
     pro_min_points_per_cell: int = 1,
-    pro_max_supports: int = 120,
+    pro_max_supports: int = 90,
     pro_interface: bool = True,
+    external_tree: bool = True,
+    external_margin: float = 8.0,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
 ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     if support_type == "classic":
         if support_strategy == "pro":
@@ -1513,7 +1556,7 @@ def build_supports_for_orientation(
         return classic_tree, supports_list
 
     if support_strategy == "pro":
-        supports = pro_tree_grid_supports(
+        supports = v11_build_tree_from_growth(
             mesh=mesh,
             overhang_points=points,
             bed_z=bed_z,
@@ -1524,12 +1567,30 @@ def build_supports_for_orientation(
             safety_factor=safety_factor,
             grid_size=pro_grid_size,
             min_points_per_cell=pro_min_points_per_cell,
-            max_supports=pro_max_supports,
+            max_tips=pro_max_supports,
             tip_gap_mm=tip_gap_mm,
             ray_clearance_mm=ray_clearance_mm,
             downray_filter=downray_filter,
             max_branch_angle_deg=max_branch_angle_deg,
             add_interface=pro_interface,
+            external_tree=external_tree,
+            external_margin=external_margin,
+            fast_mode=fast_mode,
+            strict_collision=strict_collision,
+        )
+        supports = apply_taper_to_tree(
+            supports,
+            bed_z=bed_z,
+            support_radius=support_radius,
+            nozzle_mm=nozzle_mm,
+        )
+        supports = prune_colliding_supports_v11_5(
+            supports,
+            mesh=mesh,
+            ray_clearance_mm=ray_clearance_mm,
+            support_radius=support_radius,
+            fast_mode=fast_mode,
+            strict_collision=strict_collision,
         )
         supports["target_volume"] = float(target_volume)
         supports["target_support_count"] = int(target_support_count)
@@ -1561,6 +1622,12 @@ def build_supports_for_orientation(
         min_cluster_points=min_cluster_points,
     )
     supports = prune_unused_trunks(supports)
+    supports = apply_taper_to_tree(
+        supports,
+        bed_z=bed_z,
+        support_radius=support_radius,
+        nozzle_mm=nozzle_mm,
+    )
 
     if auto_density:
         center_x = float(points[:, 0].mean()) if len(points) else 0.0
@@ -1592,11 +1659,15 @@ def build_supports_for_orientation(
         supports,
         max_branch_angle_deg=max_branch_angle_deg,
     )
-    supports["collision_count"] = collision_count_for_tree(
+    supports = prune_colliding_supports_v11_5(
         supports,
-        mesh,
-        clearance_mm=ray_clearance_mm,
-    ) + load_path_bad_count
+        mesh=mesh,
+        ray_clearance_mm=ray_clearance_mm,
+        support_radius=support_radius,
+        fast_mode=fast_mode,
+        strict_collision=strict_collision,
+    )
+    supports["collision_count"] = int(supports.get("collision_count", 0)) + int(load_path_bad_count)
     supports["disconnected_count"] = disconnected_count_for_tree(supports)
     supports["target_volume"] = float(target_volume)
     supports["target_support_count"] = int(target_support_count)
@@ -1645,6 +1716,10 @@ def evaluate_orientation(
     pro_min_points_per_cell: int,
     pro_max_supports: int,
     pro_interface: bool,
+    external_tree: bool,
+    external_margin: float,
+    fast_mode: bool,
+    strict_collision: bool,
 ) -> AngleScanResult:
     try:
         mesh, points, bed_z = GeometryProcessor.process_rotated_mesh(
@@ -1691,6 +1766,10 @@ def evaluate_orientation(
             pro_min_points_per_cell,
             pro_max_supports,
             pro_interface,
+            external_tree,
+            external_margin,
+            fast_mode,
+            strict_collision,
         )
 
         feasibility = PhysicsMotor.assess_support_feasibility(
@@ -1707,6 +1786,9 @@ def evaluate_orientation(
         stability_bonus = orientation_stability_bonus(mesh, bed_z, rho_deg, theta_deg)
         final_score = float(feasibility["score"]["value"]) + stability_bonus
 
+        structure = feasibility.get("support_structure", {})
+        coverage_info = feasibility.get("coverage", {})
+
         return AngleScanResult(
             rho=float(rho_deg),
             theta=float(theta_deg),
@@ -1718,7 +1800,13 @@ def evaluate_orientation(
             score=float(final_score),
             compression_ok=bool(feasibility["physics"]["all_compression_ok"]),
             buckling_ok=bool(feasibility["physics"]["all_buckling_ok"]),
-            support_count=int(feasibility["support_structure"]["total_count"]),
+            support_count=int(structure.get("total_count", 0)),
+            collision_count=int(structure.get("collision_count", 0)),
+            disconnected_count=int(structure.get("disconnected_count", 0)),
+            pruned_branches=int(structure.get("pruned_branches", 0)),
+            pruned_trunks=int(structure.get("pruned_trunks", 0)),
+            coverage_ok=bool(coverage_info.get("ok", False)),
+            reason=infeasibility_reason_from_feasibility(feasibility),
         )
 
     except Exception as e:
@@ -1735,6 +1823,12 @@ def evaluate_orientation(
             compression_ok=False,
             buckling_ok=False,
             support_count=0,
+            collision_count=0,
+            disconnected_count=0,
+            pruned_branches=0,
+            pruned_trunks=0,
+            coverage_ok=False,
+            reason="exception",
             error=str(e),
         )
 
@@ -1761,30 +1855,50 @@ def estimate_bed_contact_area(mesh: trimesh.Trimesh, bed_z: float, tolerance_mm:
 
 def orientation_stability_bonus(mesh: trimesh.Trimesh, bed_z: float, rho_deg: float, theta_deg: float) -> float:
     """
-    Higher score for flat contact and lower height.
-    Also mildly rewards 0°/0° if the model really has a good base.
+    Print-logic orientation prior.
+
+    The optimizer should not rotate a flat-base model into a strange angle just
+    because coverage looks higher. This bonus rewards:
+    - large bed contact area
+    - low model height
+    - staying close to the original orientation
+    - especially rho=0, theta=0 when the model has a decent flat base
     """
     contact_area = estimate_bed_contact_area(mesh, bed_z)
     height = float(mesh.bounds[1][2] - mesh.bounds[0][2])
 
-    # Contact area can be large; keep coefficient modest.
-    contact_bonus = contact_area * 0.02
-    height_penalty = height * 0.35
+    contact_bonus = contact_area * 0.08
+    height_penalty = height * 0.45
 
-    # Mild orientation prior: flat original orientation is often preferred for flat-base models.
+    rotation_penalty = 1.8 * abs(float(theta_deg)) + 0.55 * min(abs(float(rho_deg)), abs(180.0 - float(rho_deg)))
+
     zero_angle_bonus = 0.0
     if abs(rho_deg) < 1e-6 and abs(theta_deg) < 1e-6:
-        zero_angle_bonus = 120.0
+        zero_angle_bonus = 450.0
 
-    return float(contact_bonus - height_penalty + zero_angle_bonus)
+    near_zero_bonus = max(0.0, 120.0 - 2.0 * abs(float(theta_deg)) - 0.6 * abs(float(rho_deg)))
 
+    return float(contact_bonus - height_penalty - rotation_penalty + zero_angle_bonus + near_zero_bonus)
 
 def choose_best_result(results: List[AngleScanResult]) -> AngleScanResult:
+    """
+    Prefer feasible solutions. Among infeasible ones, prefer fewer hard violations
+    before raw score, so a high-coverage solution with many collisions does not
+    look better than a cleaner support path.
+    """
     feasible = [r for r in results if r.feasible]
     if feasible:
         return max(feasible, key=lambda r: r.score)
-    return max(results, key=lambda r: (r.coverage_percent, r.score))
 
+    return max(
+        results,
+        key=lambda r: (
+            -int(getattr(r, "collision_count", 0)),
+            -int(getattr(r, "disconnected_count", 0)),
+            bool(getattr(r, "coverage_ok", False)),
+            float(getattr(r, "score", -1e9)),
+        ),
+    )
 
 def adaptive_scan_orientations(
     original_mesh: trimesh.Trimesh,
@@ -1824,6 +1938,10 @@ def adaptive_scan_orientations(
     pro_min_points_per_cell: int,
     pro_max_supports: int,
     pro_interface: bool,
+    external_tree: bool,
+    external_margin: float,
+    fast_mode: bool,
+    strict_collision: bool,
     initial_step: float = 60.0,
     min_step: float = 1.0,
     top_k: int = 2,
@@ -1882,12 +2000,16 @@ def adaptive_scan_orientations(
             density_grid_size=density_grid_size,
             density_min_points_per_cell=density_min_points_per_cell,
             max_density_supports=max_density_supports,
-            density_target_coverage=density_target_coverage,
+            density_target_coverage=max(float(density_target_coverage), float(min_coverage)),
             support_strategy=support_strategy,
             pro_grid_size=pro_grid_size,
             pro_min_points_per_cell=pro_min_points_per_cell,
             pro_max_supports=pro_max_supports,
             pro_interface=pro_interface,
+            external_tree=external_tree,
+            external_margin=external_margin,
+            fast_mode=fast_mode,
+            strict_collision=strict_collision,
         )
 
     # Coarse grid. Include theta=90 even if step is 60.
@@ -1909,7 +2031,23 @@ def adaptive_scan_orientations(
         if feasible:
             anchors = sorted(feasible, key=lambda r: r.score, reverse=True)[:top_k]
         else:
-            anchors = sorted(current, key=lambda r: (r.coverage_percent, r.score), reverse=True)[:1]
+            # Prefer clean / low-collision candidates before pure coverage.
+            anchors = sorted(
+                current,
+                key=lambda r: (
+                    -int(getattr(r, "collision_count", 0)),
+                    -int(getattr(r, "disconnected_count", 0)),
+                    bool(getattr(r, "coverage_ok", False)),
+                    float(getattr(r, "coverage_percent", 0.0)),
+                    float(getattr(r, "score", -1e9)),
+                ),
+                reverse=True,
+            )[:max(1, top_k)]
+
+        # Always keep original flat orientation in the refinement set.
+        zero_candidate = evaluated.get((0.0, 0.0))
+        if zero_candidate is not None and all(abs(a.rho) > 1e-6 or abs(a.theta) > 1e-6 for a in anchors):
+            anchors.append(zero_candidate)
 
         for a in anchors:
             local_rhos = [
@@ -2044,7 +2182,7 @@ def classic_supports_collision_safe(
     return supports
 
 
-def support_tree_has_valid_load_paths(tree: Dict[str, Any], max_branch_angle_deg: float = 80.0) -> int:
+def support_tree_has_valid_load_paths(tree: Dict[str, Any], max_branch_angle_deg: float = 70.0) -> int:
     """
     Count branches that are too horizontal to be physically reasonable.
     """
@@ -2430,6 +2568,10 @@ def pro_tree_grid_supports(
     downray_filter: bool,
     max_branch_angle_deg: float,
     add_interface: bool = True,
+    external_tree: bool = True,
+    external_margin: float = 8.0,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
 ) -> Dict[str, Any]:
     """
     Beta V10.1 grouped tree engine.
@@ -2475,7 +2617,7 @@ def pro_tree_grid_supports(
     # This is the critical slicer-like grouping control.
     # Larger grid_size -> fewer contact reps.
     # trunk_group_eps controls how many reps share one trunk.
-    trunk_group_eps = max(grid_size * 2.8, support_radius * 6.0)
+    trunk_group_eps = max(grid_size * 1.8, support_radius * 4.0)
 
     labels = DBSCAN(eps=trunk_group_eps, min_samples=1).fit(reps[:, :2]).labels_
     unique_labels = sorted(set(labels))
@@ -2489,7 +2631,7 @@ def pro_tree_grid_supports(
 
         # Limit branches per trunk to avoid a dense forest.
         # Pick higher points first because they are usually more critical.
-        max_branches_for_trunk = 10
+        max_branches_for_trunk = max(10, min(24, int(max_supports / max(1, len(unique_labels))) + 4))
         if len(group) > max_branches_for_trunk:
             order = np.argsort(group[:, 2])[-max_branches_for_trunk:]
             group = group[order]
@@ -2690,6 +2832,1221 @@ def pro_interface_mesh(interfaces: List[Dict[str, float]]) -> trimesh.Trimesh:
     return trimesh.util.concatenate(meshes)
 
 
+
+# =========================================================
+# BETA V10.2 COVERAGE FIX HELPERS
+# =========================================================
+
+def extract_support_contact_points_v10(tree: Dict[str, Any]) -> np.ndarray:
+    """
+    Robust contact extraction for both classic and tree supports.
+
+    Old coverage logic missed some grouped-tree contacts. This function reads:
+    - tree branch endpoints x2/y2/z2
+    - interface disks x/y/z
+    - classic vertical support tops x/y/z_top
+    """
+    pts = []
+
+    for b in tree.get("branches", []):
+        if all(k in b for k in ("x2", "y2", "z2")):
+            pts.append([float(b["x2"]), float(b["y2"]), float(b["z2"])])
+        elif all(k in b for k in ("x", "y", "z_top")):
+            pts.append([float(b["x"]), float(b["y"]), float(b["z_top"])])
+
+    for it in tree.get("interfaces", []):
+        if all(k in it for k in ("x", "y", "z")):
+            pts.append([float(it["x"]), float(it["y"]), float(it["z"])])
+
+    if not pts:
+        return np.empty((0, 3), dtype=float)
+
+    return np.asarray(pts, dtype=float)
+
+
+def coverage_v10(points: np.ndarray, supports: Dict[str, Any], max_xy_distance: float) -> float:
+    contacts = extract_support_contact_points_v10(supports)
+    return calculate_coverage_for_contact_points(points, contacts, max_xy_distance=max_xy_distance)
+
+
+
+# =========================================================
+# BETA V11 REAL TREE GROWTH ENGINE
+# =========================================================
+
+def v11_select_tip_points(
+    points: np.ndarray,
+    grid_size: float = 6.0,
+    min_points_per_cell: int = 1,
+    max_tips: int = 220,
+) -> np.ndarray:
+    """
+    Select support tips from overhang regions.
+    One tip per XY grid cell, prioritizing the highest point in the cell.
+    """
+    return pro_grid_support_points(
+        points,
+        grid_size=grid_size,
+        min_points_per_cell=min_points_per_cell,
+        max_points=max_tips,
+    )
+
+
+def v11_try_safe_curve(
+    mesh: trimesh.Trimesh,
+    p0,
+    p2,
+    center_xy,
+    lift: float,
+    clearance: float,
+    samples: int = 8,
+):
+    """
+    Try several Bezier control points. Return a collision-free mid point or None.
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    cx, cy = center_xy
+
+    ux, uy = outward_unit_from_center(float((p0[0] + p2[0]) / 2.0), float((p0[1] + p2[1]) / 2.0), cx, cy)
+
+    candidates = []
+    base_mid = (p0 + p2) / 2.0
+    base_mid[2] += lift
+    candidates.append(base_mid.copy())
+
+    for scale in [1.0, 1.8, 2.8, 4.0]:
+        m = base_mid.copy()
+        m[0] += ux * lift * scale
+        m[1] += uy * lift * scale
+        candidates.append(m)
+
+    for ang in np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False):
+        m = base_mid.copy()
+        m[0] += np.cos(ang) * lift * 1.5
+        m[1] += np.sin(ang) * lift * 1.5
+        candidates.append(m)
+
+    for mid in candidates:
+        if not curve_hits_mesh(mesh, p0, mid, p2, clearance_mm=clearance, samples=samples):
+            return [float(mid[0]), float(mid[1]), float(mid[2])]
+
+    return None
+
+
+def v11_downward_grow_nodes(
+    mesh: trimesh.Trimesh,
+    tips: np.ndarray,
+    bed_z: float,
+    center_x: float,
+    center_y: float,
+    step_down: float,
+    merge_radius: float,
+    max_branch_angle_deg: float,
+    clearance: float,
+) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+    """
+    Grow branches from tips downward.
+
+    nodes:
+      {id, x, y, z, is_tip}
+    edges:
+      child -> parent, where parent is lower in Z.
+
+    Algorithm:
+      1) start with tip nodes
+      2) repeatedly move each active node downward
+      3) nearby nodes at similar/lower z merge
+      4) stop when near bed
+    """
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Tuple[int, int]] = []
+
+    for p in tips:
+        nodes.append({
+            "id": len(nodes),
+            "x": float(p[0]),
+            "y": float(p[1]),
+            "z": float(p[2]),
+            "is_tip": True,
+        })
+
+    active = list(range(len(nodes)))
+    max_iters = 80
+
+    for _ in range(max_iters):
+        if not active:
+            break
+
+        next_active = []
+        created_this_round = []
+
+        # higher first, so merge decisions are stable
+        active = sorted(active, key=lambda i: nodes[i]["z"], reverse=True)
+
+        for nid in active:
+            n = nodes[nid]
+            if n["z"] <= bed_z + step_down * 1.5:
+                continue
+
+            # Preferred target is downward with slight inward/outward relaxation.
+            tx = n["x"]
+            ty = n["y"]
+            tz = max(bed_z + step_down, n["z"] - step_down)
+
+            # Merge with an existing lower/nearby growth node if possible.
+            merge_candidate = None
+            best_d = 1e18
+            for oid, other in enumerate(nodes):
+                if oid == nid:
+                    continue
+                if other["z"] >= n["z"] - 0.5:
+                    continue
+                dz = abs(other["z"] - tz)
+                if dz > step_down * 1.2:
+                    continue
+                dxy = float(np.hypot(other["x"] - n["x"], other["y"] - n["y"]))
+                if dxy < merge_radius and dxy < best_d:
+                    merge_candidate = oid
+                    best_d = dxy
+
+            if merge_candidate is not None:
+                target_id = merge_candidate
+                target = nodes[target_id]
+                angle = branch_vertical_angle_deg([n["x"], n["y"], n["z"]], [target["x"], target["y"], target["z"]])
+                if angle <= max_branch_angle_deg:
+                    mid = v11_try_safe_curve(
+                        mesh,
+                        [n["x"], n["y"], n["z"]],
+                        [target["x"], target["y"], target["z"]],
+                        (center_x, center_y),
+                        lift=max(0.5, step_down * 0.2),
+                        clearance=clearance,
+                        samples=6,
+                    )
+                    if mid is not None:
+                        edges.append((nid, target_id))
+                        continue
+
+            # Otherwise create a new lower node.
+            # Slightly bias toward center as it descends, causing tree convergence.
+            blend = 0.10
+            tx = (1.0 - blend) * tx + blend * center_x
+            ty = (1.0 - blend) * ty + blend * center_y
+
+            angle = branch_vertical_angle_deg([n["x"], n["y"], n["z"]], [tx, ty, tz])
+            if angle > max_branch_angle_deg:
+                # If too angled, drop mostly vertically.
+                tx = n["x"]
+                ty = n["y"]
+
+            mid = v11_try_safe_curve(
+                mesh,
+                [n["x"], n["y"], n["z"]],
+                [tx, ty, tz],
+                (center_x, center_y),
+                lift=max(0.5, step_down * 0.2),
+                clearance=clearance,
+                samples=6,
+            )
+            if mid is None:
+                # Last fallback: exact vertical if safe.
+                if curve_hits_mesh(
+                    mesh,
+                    [n["x"], n["y"], n["z"]],
+                    [n["x"], n["y"], (n["z"] + tz) / 2.0],
+                    [n["x"], n["y"], tz],
+                    clearance_mm=clearance,
+                    samples=6,
+                ):
+                    continue
+                tx, ty = n["x"], n["y"]
+
+            new_id = len(nodes)
+            nodes.append({
+                "id": new_id,
+                "x": float(tx),
+                "y": float(ty),
+                "z": float(tz),
+                "is_tip": False,
+            })
+            edges.append((nid, new_id))
+            next_active.append(new_id)
+            created_this_round.append(new_id)
+
+        # Merge newly created nodes horizontally to prevent a forest.
+        if created_this_round:
+            merged_active = []
+            used = set()
+            for nid in created_this_round:
+                if nid in used:
+                    continue
+                group = [nid]
+                used.add(nid)
+                for oid in created_this_round:
+                    if oid in used:
+                        continue
+                    if abs(nodes[oid]["z"] - nodes[nid]["z"]) <= step_down * 0.5:
+                        if np.hypot(nodes[oid]["x"] - nodes[nid]["x"], nodes[oid]["y"] - nodes[nid]["y"]) <= merge_radius:
+                            group.append(oid)
+                            used.add(oid)
+
+                if len(group) == 1:
+                    merged_active.append(nid)
+                else:
+                    mx = float(np.mean([nodes[g]["x"] for g in group]))
+                    my = float(np.mean([nodes[g]["y"] for g in group]))
+                    mz = float(np.mean([nodes[g]["z"] for g in group]))
+                    mid_id = len(nodes)
+                    nodes.append({"id": mid_id, "x": mx, "y": my, "z": mz, "is_tip": False})
+                    for g in group:
+                        edges.append((g, mid_id))
+                    merged_active.append(mid_id)
+
+            next_active = merged_active
+
+        active = next_active
+
+    return nodes, edges
+
+
+def v11_build_tree_from_growth(
+    mesh: trimesh.Trimesh,
+    overhang_points: np.ndarray,
+    bed_z: float,
+    material: str,
+    nozzle_mm: float,
+    support_radius: float,
+    mesh_mass_g: float,
+    safety_factor: float,
+    grid_size: float,
+    min_points_per_cell: int,
+    max_tips: int,
+    tip_gap_mm: float,
+    ray_clearance_mm: float,
+    downray_filter: bool,
+    max_branch_angle_deg: float,
+    add_interface: bool = True,
+    external_tree: bool = True,
+    external_margin: float = 8.0,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
+) -> Dict[str, Any]:
+    """
+    Real growth-based tree support:
+    - select tips from overhangs
+    - grow downward in steps
+    - merge nearby paths
+    - create grounded trunks at terminal nodes
+    """
+    pts = overhang_points
+    if downray_filter:
+        pts = filter_points_needing_support_by_downray(
+            mesh, pts, bed_z=bed_z, min_drop_mm=1.0, surface_offset_mm=0.35
+        )
+
+    tips_raw = v11_select_tip_points(
+        pts,
+        grid_size=grid_size,
+        min_points_per_cell=min_points_per_cell,
+        max_tips=max_tips,
+    )
+
+    trunks: List[Dict[str, Any]] = []
+    branches: List[Dict[str, Any]] = []
+    interfaces: List[Dict[str, Any]] = []
+
+    if len(tips_raw) == 0:
+        return {
+            "trunks": trunks,
+            "branches": branches,
+            "interfaces": interfaces,
+            "physics": {"all_ok": False, "reason": "No tips selected"},
+        }
+
+    cx = float(np.mean(tips_raw[:, 0]))
+    cy = float(np.mean(tips_raw[:, 1]))
+
+    # Offset tips outward from surface.
+    tips = []
+    for p in tips_raw:
+        tips.append(contact_point_with_normal_offset((p[0], p[1], p[2]), cx, cy, tip_gap_mm))
+    tips = np.asarray(tips, dtype=float)
+
+    step_down = max(5.0, grid_size * 0.85)
+    merge_radius = max(grid_size * 1.5, support_radius * 5.0)
+    clearance = ray_clearance_mm + support_radius * 0.55
+
+    nodes, edges = v11_downward_grow_nodes(
+        mesh=mesh,
+        tips=tips,
+        bed_z=bed_z,
+        center_x=cx,
+        center_y=cy,
+        step_down=step_down,
+        merge_radius=merge_radius,
+        max_branch_angle_deg=max_branch_angle_deg,
+        clearance=clearance,
+    )
+
+    if not nodes or not edges:
+        return {
+            "trunks": trunks,
+            "branches": branches,
+            "interfaces": interfaces,
+            "physics": {"all_ok": False, "reason": "Growth produced no graph"},
+        }
+
+    # terminal nodes are parents with no outgoing lower edge
+    children = set(c for c, p in edges)
+    parents = set(p for c, p in edges)
+    terminal_ids = sorted(list(parents - children))
+    if not terminal_ids:
+        terminal_ids = sorted(list(parents))
+
+    # Create one trunk for each terminal node, from bed to terminal node.
+    terminal_to_trunk = {}
+    point_load_each = StructuralAnalyzer.estimate_point_load_n(mesh_mass_g, max(1, len(tips)))
+
+    for tid in terminal_ids:
+        n = nodes[tid]
+        trunk_x, trunk_y = float(n["x"]), float(n["y"])
+        if external_tree:
+            trunk_x, trunk_y = outside_xy_bbox_point(
+                trunk_x,
+                trunk_y,
+                mesh.bounds,
+                margin=external_margin,
+            )
+        trunk_top_z = float(max(n["z"], bed_z + 2.0))
+        height = trunk_top_z - bed_z
+        if height <= 1.0:
+            continue
+
+        # Collision check for vertical trunk.
+        if ray_hits_mesh_between(
+            mesh,
+            [trunk_x, trunk_y, bed_z + 0.5],
+            [trunk_x, trunk_y, trunk_top_z - 0.5],
+            clearance_mm=ray_clearance_mm + support_radius * 0.85,
+        ):
+            # Try nudging trunk outward.
+            ux, uy = outward_unit_from_center(trunk_x, trunk_y, cx, cy)
+            success = False
+            for dist in [grid_size * 0.4, grid_size * 0.8, grid_size * 1.2]:
+                tx = trunk_x + ux * dist
+                ty = trunk_y + uy * dist
+                if not ray_hits_mesh_between(
+                    mesh,
+                    [tx, ty, bed_z + 0.5],
+                    [tx, ty, trunk_top_z - 0.5],
+                    clearance_mm=ray_clearance_mm + support_radius * 0.85,
+                ):
+                    trunk_x, trunk_y = float(tx), float(ty)
+                    success = True
+                    break
+            if not success:
+                continue
+
+        # Count approximate downstream tips for force.
+        force = point_load_each * 4.0
+        radius = StructuralAnalyzer.required_radius_for_force(
+            force,
+            height,
+            material,
+            nozzle_mm,
+            safety_factor,
+            visual_min_radius=support_radius * 1.5,
+        )
+
+        trunk_id = len(trunks)
+        trunks.append({
+            "id": int(trunk_id),
+            "tree_id": int(trunk_id),
+            "x": float(trunk_x),
+            "y": float(trunk_y),
+            "z_bottom": float(bed_z),
+            "z_top": float(trunk_top_z),
+            "radius": float(radius),
+            "height": float(height),
+            "length": float(height),
+            "force_n": float(force),
+            "point_count": 1,
+            "ok": True,
+        })
+        terminal_to_trunk[tid] = trunk_id
+
+    # helper to find closest trunk/terminal for a node
+    def nearest_trunk_for_node(nid):
+        if not terminal_to_trunk:
+            return None
+        n = nodes[nid]
+        best_tid = None
+        best_d = 1e18
+        for term_id, trunk_id in terminal_to_trunk.items():
+            t = nodes[term_id]
+            d = np.hypot(float(n["x"]) - float(t["x"]), float(n["y"]) - float(t["y"])) + abs(float(n["z"]) - float(t["z"])) * 0.15
+            if d < best_d:
+                best_d = d
+                best_tid = trunk_id
+        return best_tid
+
+    # Convert graph edges to branch bezier segments.
+    for child, parent in edges:
+        c = nodes[child]
+        p = nodes[parent]
+        trunk_id = terminal_to_trunk.get(parent, nearest_trunk_for_node(parent))
+        if trunk_id is None:
+            continue
+
+        p0 = [float(c["x"]), float(c["y"]), float(c["z"])]
+        p2 = [float(p["x"]), float(p["y"]), float(p["z"])]
+        lift = max(0.5, step_down * 0.25)
+        if external_tree:
+            mid = external_branch_midpoint(p0, p2, mesh, lift=max(lift, external_margin * 0.45))
+            if fast_bezier_hits_mesh(
+                mesh,
+                p0,
+                mid,
+                p2,
+                clearance_mm=clearance + support_radius * 0.45,
+                samples=adaptive_collision_samples(14, fast_mode),
+                strict=strict_collision,
+            ):
+                mid = None
+        else:
+            mid = v11_try_safe_curve(mesh, p0, p2, (cx, cy), lift=lift, clearance=clearance, samples=6)
+        if mid is None:
+            continue
+
+        if branch_vertical_angle_deg(p0, p2) > max_branch_angle_deg:
+            continue
+
+        if fast_bezier_hits_mesh(
+            mesh,
+            p0,
+            mid,
+            p2,
+            clearance_mm=clearance + support_radius * 0.35,
+            samples=adaptive_collision_samples(14, fast_mode),
+            strict=strict_collision,
+        ):
+            continue
+
+        length = approximate_bezier_length(p0, mid, p2, samples=6)
+        physics_radius = StructuralAnalyzer.required_radius_for_force(
+            point_load_each,
+            length,
+            material,
+            nozzle_mm,
+            safety_factor,
+            visual_min_radius=support_radius * 0.48,
+        )
+        z_mid = (float(p0[2]) + float(p2[2])) / 2.0
+        taper_radius = taper_radius_for_edge(
+            z_mid=z_mid,
+            bed_z=bed_z,
+            top_z=max(float(np.max(tips[:, 2])), bed_z + 1.0),
+            root_radius=max(support_radius * 1.8, nozzle_mm * 4.0),
+            tip_radius=max(support_radius * 0.42, nozzle_mm * 1.35),
+        )
+        radius = max(float(physics_radius), float(taper_radius))
+
+        branches.append({
+            "tree_id": int(trunk_id),
+            "trunk_id": int(trunk_id),
+            "x1": float(p0[0]),
+            "y1": float(p0[1]),
+            "z1": float(p0[2]),
+            "xm": float(mid[0]),
+            "ym": float(mid[1]),
+            "zm": float(mid[2]),
+            "x2": float(p2[0]),
+            "y2": float(p2[1]),
+            "z2": float(p2[2]),
+            "radius": float(radius),
+            "height": float(abs(p0[2] - p2[2])),
+            "length": float(length),
+            "force_n": float(point_load_each),
+            "ok": True,
+        })
+
+    if add_interface:
+        for p in tips:
+            interfaces.append({
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "z": float(p[2]),
+                "radius": float(max(support_radius * 1.05, grid_size * 0.16)),
+                "height": float(max(0.35, nozzle_mm)),
+            })
+
+    tree = {
+        "trunks": trunks,
+        "branches": branches,
+        "interfaces": interfaces,
+        "physics": {
+            "all_ok": True,
+            "engine": "v11_growth_tree",
+            "tip_count": int(len(tips)),
+            "node_count": int(len(nodes)),
+            "edge_count": int(len(edges)),
+            "trunk_count": len(trunks),
+            "branch_count": len(branches),
+        },
+    }
+
+    tree = prune_unused_trunks(tree)
+    tree["collision_count"] = collision_count_for_tree(tree, mesh, clearance_mm=ray_clearance_mm)
+    tree["disconnected_count"] = disconnected_count_for_tree(tree)
+    return tree
+
+
+
+# =========================================================
+# BETA V11.1 LOAD TAPER + HARD COLLISION HELPERS
+# =========================================================
+
+def tapered_radius_by_height(
+    z: float,
+    bed_z: float,
+    max_z: float,
+    base_radius: float,
+    tip_radius: float,
+    power: float = 1.35,
+) -> float:
+    """
+    Height-dependent radius function.
+
+    z = bed_z -> base_radius
+    z = max_z -> tip_radius
+    """
+    denom = max(1e-6, float(max_z) - float(bed_z))
+    h = np.clip((float(z) - float(bed_z)) / denom, 0.0, 1.0)
+    r = float(tip_radius) + (float(base_radius) - float(tip_radius)) * ((1.0 - h) ** float(power))
+    return float(max(tip_radius, r))
+
+
+def apply_taper_to_tree(
+    tree: Dict[str, Any],
+    bed_z: float,
+    support_radius: float,
+    nozzle_mm: float,
+) -> Dict[str, Any]:
+    """
+    Make bottom thicker and top thinner.
+    """
+    z_values = []
+    for t in tree.get("trunks", []):
+        z_values.extend([float(t.get("z_bottom", bed_z)), float(t.get("z_top", bed_z))])
+    for b in tree.get("branches", []):
+        z_values.extend([float(b.get("z1", bed_z)), float(b.get("z2", bed_z))])
+
+    max_z = max(z_values) if z_values else bed_z + 1.0
+
+    base_radius = max(float(support_radius) * 1.75, float(nozzle_mm) * 4.0)
+    tip_radius = max(float(support_radius) * 0.42, float(nozzle_mm) * 1.35)
+
+    for t in tree.get("trunks", []):
+        z_mid = (float(t.get("z_bottom", bed_z)) + float(t.get("z_top", bed_z))) / 2.0
+        r = tapered_radius_by_height(
+            z_mid,
+            bed_z,
+            max_z,
+            base_radius,
+            max(tip_radius, support_radius * 0.9),
+        )
+        t["radius"] = float(max(float(t.get("radius", 0.0)), r))
+
+    for b in tree.get("branches", []):
+        z_mid = (float(b.get("z1", bed_z)) + float(b.get("z2", bed_z))) / 2.0
+        r = tapered_radius_by_height(
+            z_mid,
+            bed_z,
+            max_z,
+            base_radius * 0.75,
+            tip_radius,
+        )
+        b["radius"] = float(max(tip_radius, r))
+
+    return tree
+
+
+def hard_collision_count_v11(
+    tree: Dict[str, Any],
+    mesh: trimesh.Trimesh,
+    ray_clearance_mm: float,
+    support_radius: float,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
+) -> int:
+    """
+    If any generated support crosses original mesh, count it as hard collision.
+    Feasibility already requires collision_count == 0.
+    """
+    collisions = 0
+
+    for b in tree.get("branches", []):
+        if all(k in b for k in ("x1", "y1", "z1", "xm", "ym", "zm", "x2", "y2", "z2")):
+            radius = float(b.get("radius", support_radius))
+            if fast_bezier_hits_mesh(
+                mesh,
+                [b["x1"], b["y1"], b["z1"]],
+                [b["xm"], b["ym"], b["zm"]],
+                [b["x2"], b["y2"], b["z2"]],
+                clearance_mm=float(ray_clearance_mm) + radius * 0.65,
+                samples=adaptive_collision_samples(10, fast_mode),
+                strict=strict_collision,
+            ):
+                collisions += 1
+
+    for t in tree.get("trunks", []):
+        radius = float(t.get("radius", support_radius))
+        x = float(t.get("x", 0.0))
+        y = float(t.get("y", 0.0))
+        z0 = float(t.get("z_bottom", 0.0))
+        z1 = float(t.get("z_top", 0.0))
+        if z1 - z0 <= 1.0:
+            continue
+        if fast_segment_hits_mesh_cached(
+            mesh,
+            [x, y, z0 + 0.5],
+            [x, y, z1 - 0.5],
+            clearance_mm=float(ray_clearance_mm) + radius * 0.55,
+        ):
+            collisions += 1
+
+    return int(collisions)
+
+
+
+
+def bezier_points(p0, p1, p2, samples: int = 16) -> np.ndarray:
+    """
+    Return sampled points on a quadratic Bezier curve.
+
+    B(t) = (1-t)^2 p0 + 2(1-t)t p1 + t^2 p2
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+
+    ts = np.linspace(0.0, 1.0, int(max(2, samples)))
+    pts = []
+    for t in ts:
+        pts.append(((1.0 - t) ** 2) * p0 + 2.0 * (1.0 - t) * t * p1 + (t ** 2) * p2)
+
+    return np.asarray(pts, dtype=float)
+
+
+# =========================================================
+# BETA V11.2 EXTERNAL TREE / FORBIDDEN ZONE HELPERS
+# =========================================================
+
+def outside_xy_bbox_point(
+    x: float,
+    y: float,
+    bounds: np.ndarray,
+    margin: float = 8.0,
+) -> Tuple[float, float]:
+    """
+    Push an XY point outside model XY bounding box.
+    This prevents tree supports from growing through hollow model interiors.
+    """
+    xmin, ymin = float(bounds[0][0]), float(bounds[0][1])
+    xmax, ymax = float(bounds[1][0]), float(bounds[1][1])
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+
+    dx = float(x) - cx
+    dy = float(y) - cy
+
+    # Choose dominant outward side.
+    if abs(dx) >= abs(dy):
+        ox = xmax + margin if dx >= 0 else xmin - margin
+        oy = float(np.clip(y, ymin - margin, ymax + margin))
+    else:
+        oy = ymax + margin if dy >= 0 else ymin - margin
+        ox = float(np.clip(x, xmin - margin, xmax + margin))
+
+    return float(ox), float(oy)
+
+
+def segment_samples_hit_mesh(
+    mesh: trimesh.Trimesh,
+    p0,
+    p1,
+    clearance_mm: float,
+    samples: int = 12,
+) -> bool:
+    """
+    Conservative forbidden-zone check:
+    sample points along a support segment and check if they are inside or very near mesh.
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+
+    for t in np.linspace(0.08, 0.92, samples):
+        p = p0 * (1.0 - t) + p1 * t
+
+        # Signed distance is expensive but available in trimesh.
+        try:
+            sd = trimesh.proximity.signed_distance(mesh, [p])[0]
+            # Positive usually means inside for watertight meshes.
+            if sd > -float(clearance_mm):
+                return True
+        except Exception:
+            # Fallback: nearest surface distance.
+            try:
+                closest, dist, _ = trimesh.proximity.closest_point(mesh, [p])
+                if float(dist[0]) < float(clearance_mm):
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
+def bezier_forbidden_zone_hit(
+    mesh: trimesh.Trimesh,
+    p0,
+    p1,
+    p2,
+    clearance_mm: float,
+    samples: int = 18,
+) -> bool:
+    """
+    Stricter check than centerline ray:
+    both curve intersection and sampled forbidden-zone proximity.
+    """
+    if curve_hits_mesh(mesh, p0, p1, p2, clearance_mm=clearance_mm, samples=samples):
+        return True
+
+    curve = bezier_points(p0, p1, p2, samples=samples)
+    for i in range(len(curve) - 1):
+        if segment_samples_hit_mesh(mesh, curve[i], curve[i + 1], clearance_mm=clearance_mm, samples=3):
+            return True
+
+    return False
+
+
+def external_branch_midpoint(p0, p2, mesh: trimesh.Trimesh, lift: float = 4.0) -> List[float]:
+    """
+    Pull midpoint outward from model center so branches do not dive into hollow interiors.
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    bounds = mesh.bounds
+    cx = float((bounds[0][0] + bounds[1][0]) / 2.0)
+    cy = float((bounds[0][1] + bounds[1][1]) / 2.0)
+
+    mid = (p0 + p2) / 2.0
+    ux, uy = outward_unit_from_center(float(mid[0]), float(mid[1]), cx, cy)
+    mid[0] += ux * max(lift, 2.0)
+    mid[1] += uy * max(lift, 2.0)
+    mid[2] += max(lift * 0.35, 0.8)
+    return [float(mid[0]), float(mid[1]), float(mid[2])]
+
+
+def taper_radius_for_edge(
+    z_mid: float,
+    bed_z: float,
+    top_z: float,
+    root_radius: float,
+    tip_radius: float,
+) -> float:
+    """
+    Radius function:
+    bottom thick, top thin.
+    """
+    return tapered_radius_by_height(
+        z=z_mid,
+        bed_z=bed_z,
+        max_z=top_z,
+        base_radius=root_radius,
+        tip_radius=tip_radius,
+        power=1.55,
+    )
+
+
+
+# =========================================================
+# BETA V11.3 OPTIMIZATION HELPERS
+# =========================================================
+
+_FAST_MESH_CACHE: Dict[int, Dict[str, Any]] = {}
+
+
+def get_fast_mesh_cache(mesh: Optional[trimesh.Trimesh]) -> Dict[str, Any]:
+    """
+    Cache expensive per-mesh data.
+    Safe because each rotated mesh object has its own id.
+    """
+    if mesh is None:
+        return {}
+
+    mid = id(mesh)
+    if mid not in _FAST_MESH_CACHE:
+        bounds = mesh.bounds
+        center = np.array([
+            (bounds[0][0] + bounds[1][0]) / 2.0,
+            (bounds[0][1] + bounds[1][1]) / 2.0,
+            (bounds[0][2] + bounds[1][2]) / 2.0,
+        ], dtype=float)
+        radius = float(np.linalg.norm(bounds[1] - bounds[0]) / 2.0)
+        _FAST_MESH_CACHE[mid] = {
+            "bounds": bounds,
+            "center": center,
+            "bbox_radius": radius,
+            "ray": mesh.ray,
+        }
+    return _FAST_MESH_CACHE[mid]
+
+
+def clear_fast_mesh_cache_if_large(max_items: int = 24) -> None:
+    """
+    Avoid memory growth during angle scans.
+    """
+    if len(_FAST_MESH_CACHE) > max_items:
+        _FAST_MESH_CACHE.clear()
+
+
+def bbox_segment_could_hit_mesh(mesh: trimesh.Trimesh, p0, p1, margin: float = 2.0) -> bool:
+    """
+    Very cheap AABB precheck before expensive ray/proximity tests.
+    If segment bounding box does not overlap mesh bounding box, skip collision.
+    """
+    cache = get_fast_mesh_cache(mesh)
+    bounds = cache.get("bounds", mesh.bounds)
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    mn = np.minimum(p0, p1) - margin
+    mx = np.maximum(p0, p1) + margin
+
+    if np.any(mx < bounds[0]) or np.any(mn > bounds[1]):
+        return False
+    return True
+
+
+def fast_segment_hits_mesh_cached(
+    mesh: Optional[trimesh.Trimesh],
+    p0,
+    p1,
+    clearance_mm: float = 0.8,
+    endpoint_trim_mm: float = 0.75,
+) -> bool:
+    """
+    Faster segment-mesh collision:
+    - cheap AABB precheck
+    - cached ray engine
+    - avoids expensive proximity unless needed elsewhere
+    """
+    if mesh is None:
+        return False
+
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    d = p1 - p0
+    length = float(np.linalg.norm(d))
+    if length <= max(clearance_mm, 1e-6):
+        return False
+
+    # Trim endpoints so intended contact point is not counted as collision.
+    trim = min(endpoint_trim_mm, length * 0.25)
+    q0 = p0 + d / length * trim
+    q1 = p1 - d / length * trim
+
+    if not bbox_segment_could_hit_mesh(mesh, q0, q1, margin=clearance_mm):
+        return False
+
+    direction = q1 - q0
+    dist = float(np.linalg.norm(direction))
+    if dist <= 1e-6:
+        return False
+    direction = direction / dist
+
+    try:
+        ray = get_fast_mesh_cache(mesh).get("ray", mesh.ray)
+        locations, _, _ = ray.intersects_location(
+            [q0],
+            [direction],
+            multiple_hits=False,
+        )
+        if len(locations) == 0:
+            return False
+        hit_dist = float(np.linalg.norm(locations[0] - q0))
+        return hit_dist < dist
+    except Exception:
+        # Fall back to old checker if ray engine fails.
+        try:
+            return ray_hits_mesh_between(mesh, q0, q1, clearance_mm=clearance_mm)
+        except Exception:
+            return False
+
+
+def fast_bezier_points(p0, p1, p2, samples: int = 10) -> np.ndarray:
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    t = np.linspace(0.0, 1.0, int(max(2, samples)))[:, None]
+    return ((1.0 - t) ** 2) * p0 + 2.0 * (1.0 - t) * t * p1 + (t ** 2) * p2
+
+
+def fast_bezier_hits_mesh(
+    mesh: Optional[trimesh.Trimesh],
+    p0,
+    p1,
+    p2,
+    clearance_mm: float = 0.8,
+    samples: int = 8,
+    strict: bool = False,
+) -> bool:
+    """
+    Optimized Bezier collision check.
+
+    strict=False:
+      checks sampled curve segments with cached ray engine only.
+      This is much faster for scanning orientations.
+
+    strict=True:
+      after fast ray check, optional proximity forbidden-zone check is used
+      by existing functions if available.
+    """
+    if mesh is None:
+        return False
+
+    curve = fast_bezier_points(p0, p1, p2, samples=samples)
+    for i in range(len(curve) - 1):
+        if fast_segment_hits_mesh_cached(
+            mesh,
+            curve[i],
+            curve[i + 1],
+            clearance_mm=clearance_mm,
+            endpoint_trim_mm=0.6,
+        ):
+            return True
+
+    if strict:
+        try:
+            # use stricter existing checker if defined
+            if "bezier_forbidden_zone_hit" in globals():
+                return bezier_forbidden_zone_hit(
+                    mesh,
+                    p0,
+                    p1,
+                    p2,
+                    clearance_mm=clearance_mm,
+                    samples=max(samples, 12),
+                )
+        except Exception:
+            return False
+
+    return False
+
+
+def adaptive_collision_samples(base_samples: int, fast_mode: bool) -> int:
+    return max(5, int(base_samples * 0.55)) if fast_mode else base_samples
+
+
+def safe_goal_density_target(density_target_coverage: float, min_coverage: float) -> float:
+    """
+    The generator should not stop at 0.15 if feasibility requires 0.30.
+    """
+    return max(float(density_target_coverage), float(min_coverage))
+
+
+def result_sort_key_v11_3(result: Any) -> float:
+    """
+    Prefer feasible, then lower goal objective / higher score.
+    Keeps compatibility with existing AngleScanResult.
+    """
+    try:
+        feasible_bonus = 1_000_000.0 if bool(result.feasible) else 0.0
+        return feasible_bonus + float(result.score)
+    except Exception:
+        try:
+            feasible_bonus = 1_000_000.0 if bool(result.get("feasible")) else 0.0
+            return feasible_bonus + float(result.get("score", -1e9))
+        except Exception:
+            return -1e9
+
+
+
+# =========================================================
+# BETA V11.4 DIAGNOSTIC HELPERS
+# =========================================================
+
+def infeasibility_reason_from_feasibility(feasibility: Dict[str, Any]) -> str:
+    reasons = []
+
+    coverage = feasibility.get("coverage", {})
+    physics = feasibility.get("physics", {})
+    structure = feasibility.get("support_structure", {})
+
+    if not bool(coverage.get("ok", False)):
+        reasons.append("coverage_below_minimum")
+
+    if not bool(physics.get("all_compression_ok", False)) or not bool(physics.get("all_buckling_ok", False)):
+        reasons.append("physics_failure")
+
+    if int(structure.get("total_count", 0)) <= 0:
+        reasons.append("no_support_generated")
+
+    if int(structure.get("collision_count", 0)) > 0:
+        reasons.append(f"support_mesh_collision:{int(structure.get('collision_count', 0))}")
+
+    if int(structure.get("disconnected_count", 0)) > 0:
+        reasons.append(f"disconnected_support_graph:{int(structure.get('disconnected_count', 0))}")
+
+    return ", ".join(reasons) if reasons else "feasible"
+
+
+
+# =========================================================
+# BETA V11.5 COLLISION PRUNING HELPERS
+# =========================================================
+
+def branch_hits_mesh_v11_5(
+    branch: Dict[str, Any],
+    mesh: trimesh.Trimesh,
+    ray_clearance_mm: float,
+    support_radius: float,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
+) -> bool:
+    if not all(k in branch for k in ("x1", "y1", "z1", "xm", "ym", "zm", "x2", "y2", "z2")):
+        return False
+
+    radius = float(branch.get("radius", support_radius))
+    return fast_bezier_hits_mesh(
+        mesh,
+        [branch["x1"], branch["y1"], branch["z1"]],
+        [branch["xm"], branch["ym"], branch["zm"]],
+        [branch["x2"], branch["y2"], branch["z2"]],
+        clearance_mm=float(ray_clearance_mm) + radius * 0.65,
+        samples=adaptive_collision_samples(10, fast_mode),
+        strict=strict_collision,
+    )
+
+
+def trunk_hits_mesh_v11_5(
+    trunk: Dict[str, Any],
+    mesh: trimesh.Trimesh,
+    ray_clearance_mm: float,
+    support_radius: float,
+) -> bool:
+    radius = float(trunk.get("radius", support_radius))
+    x = float(trunk.get("x", 0.0))
+    y = float(trunk.get("y", 0.0))
+    z0 = float(trunk.get("z_bottom", 0.0))
+    z1 = float(trunk.get("z_top", 0.0))
+
+    if z1 - z0 <= 1.0:
+        return False
+
+    return fast_segment_hits_mesh_cached(
+        mesh,
+        [x, y, z0 + 0.5],
+        [x, y, z1 - 0.5],
+        clearance_mm=float(ray_clearance_mm) + radius * 0.55,
+    )
+
+
+def prune_colliding_supports_v11_5(
+    tree: Dict[str, Any],
+    mesh: trimesh.Trimesh,
+    ray_clearance_mm: float,
+    support_radius: float,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
+) -> Dict[str, Any]:
+    """
+    Instead of generating supports and then simply declaring the whole solution
+    infeasible, remove colliding branches/trunks first.
+
+    Pipeline:
+    1. Remove branches whose curved path intersects the original mesh.
+    2. Remove trunks whose vertical body intersects the original mesh.
+    3. Remove branches attached to removed trunks.
+    4. Remove unused trunks and recompute collision/disconnected counts.
+
+    This is the key difference from V11.4:
+    collision is now handled by pruning before feasibility scoring.
+    """
+    if mesh is None:
+        return tree
+
+    branches = list(tree.get("branches", []))
+    trunks = list(tree.get("trunks", []))
+
+    kept_branches = []
+    pruned_branches = 0
+
+    for b in branches:
+        if branch_hits_mesh_v11_5(
+            b,
+            mesh=mesh,
+            ray_clearance_mm=ray_clearance_mm,
+            support_radius=support_radius,
+            fast_mode=fast_mode,
+            strict_collision=strict_collision,
+        ):
+            pruned_branches += 1
+            continue
+        kept_branches.append(b)
+
+    bad_trunk_ids = set()
+    pruned_trunks = 0
+
+    for t in trunks:
+        tid = int(t.get("id", -999))
+        if trunk_hits_mesh_v11_5(
+            t,
+            mesh=mesh,
+            ray_clearance_mm=ray_clearance_mm,
+            support_radius=support_radius,
+        ):
+            bad_trunk_ids.add(tid)
+            pruned_trunks += 1
+
+    if bad_trunk_ids:
+        before = len(kept_branches)
+        kept_branches = [
+            b for b in kept_branches
+            if int(b.get("trunk_id", -999)) not in bad_trunk_ids
+        ]
+        pruned_branches += before - len(kept_branches)
+
+    kept_trunks = [
+        t for t in trunks
+        if int(t.get("id", -999)) not in bad_trunk_ids
+    ]
+
+    tree["branches"] = kept_branches
+    tree["trunks"] = kept_trunks
+    tree = prune_unused_trunks(tree)
+
+    # After pruning, recalculate final hard constraints.
+    tree["collision_count"] = hard_collision_count_v11(
+        tree,
+        mesh=mesh,
+        ray_clearance_mm=ray_clearance_mm,
+        support_radius=support_radius,
+        fast_mode=fast_mode,
+        strict_collision=strict_collision,
+    )
+    tree["disconnected_count"] = disconnected_count_for_tree(tree)
+
+    tree["pruning"] = {
+        "pruned_branches": int(pruned_branches),
+        "pruned_trunks": int(pruned_trunks),
+        "remaining_branches": int(len(tree.get("branches", []))),
+        "remaining_trunks": int(len(tree.get("trunks", []))),
+    }
+
+    return tree
+
+
 # =========================================================
 # API ROUTES
 # =========================================================
@@ -2710,8 +4067,8 @@ def root():
 def health_check():
     return {
         "status": "healthy",
-        "loaded_file_marker": "main_beta_v10_1_grouped_tree_engine",
-        "version": "6.0.0",
+        "loaded_file_marker": "main_beta_v11_5_collision_pruning",
+        "version": "11.5.0-beta",
         "supported_materials": list(MATERIALS.keys()),
         "supported_nozzles": ALLOWED_NOZZLES,
         "support_types": [x.value for x in SupportType],
@@ -2726,7 +4083,12 @@ def health_check():
             "adaptive density supports",
             "pro grid support generator",
             "support interface layer",
-            "grouped tree trunk engine"
+            "grouped tree trunk engine",
+            "v11 growth-based recursive tree engine",
+            "height-based taper radius",
+            "hard mesh-collision infeasibility",
+            "external tree routing",
+            "stricter forbidden-zone proximity checks"
         ],
     }
 
@@ -2764,7 +4126,7 @@ async def analyze_all_orientations(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
-    max_branch_angle_deg: float = 80.0,
+    max_branch_angle_deg: float = 70.0,
     min_cluster_points: int = 3,
     auto_density: bool = True,
     density_grid_size: float = 6.0,
@@ -2772,10 +4134,14 @@ async def analyze_all_orientations(
     max_density_supports: int = 160,
     density_target_coverage: float = 0.15,
     support_strategy: Literal["pro", "legacy"] = "pro",
-    pro_grid_size: float = 10.0,
+    pro_grid_size: float = 8.0,
     pro_min_points_per_cell: int = 1,
-    pro_max_supports: int = 120,
+    pro_max_supports: int = 90,
     pro_interface: bool = True,
+    external_tree: bool = True,
+    external_margin: float = 8.0,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
 ):
     try:
         nozzle_mm = validate_nozzle(nozzle_mm)
@@ -2823,12 +4189,16 @@ async def analyze_all_orientations(
                     density_grid_size=density_grid_size,
                     density_min_points_per_cell=density_min_points_per_cell,
                     max_density_supports=max_density_supports,
-                    density_target_coverage=density_target_coverage,
+                    density_target_coverage=max(float(density_target_coverage), float(min_coverage)),
                     support_strategy=support_strategy,
                     pro_grid_size=pro_grid_size,
                     pro_min_points_per_cell=pro_min_points_per_cell,
                     pro_max_supports=pro_max_supports,
                     pro_interface=pro_interface,
+                    external_tree=external_tree,
+                    external_margin=external_margin,
+                    fast_mode=fast_mode,
+                    strict_collision=strict_collision,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -2874,12 +4244,16 @@ async def analyze_all_orientations(
                             density_grid_size=density_grid_size,
                             density_min_points_per_cell=density_min_points_per_cell,
                             max_density_supports=max_density_supports,
-                            density_target_coverage=density_target_coverage,
+                            density_target_coverage=max(float(density_target_coverage), float(min_coverage)),
                             support_strategy=support_strategy,
                             pro_grid_size=pro_grid_size,
                             pro_min_points_per_cell=pro_min_points_per_cell,
                             pro_max_supports=pro_max_supports,
                             pro_interface=pro_interface,
+                            external_tree=external_tree,
+                            external_margin=external_margin,
+                            fast_mode=fast_mode,
+                            strict_collision=strict_collision,
                         )
                         all_results.append(result)
 
@@ -2934,6 +4308,8 @@ async def analyze_all_orientations(
                     "pro_min_points_per_cell": int(pro_min_points_per_cell),
                     "pro_max_supports": int(pro_max_supports),
                     "pro_interface": bool(pro_interface),
+                    "external_tree": bool(external_tree),
+                    "external_margin": float(external_margin),
                 },
                 "summary": {
                     "total_orientations_tested": len(all_results),
@@ -2998,7 +4374,7 @@ async def generate_and_export(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
-    max_branch_angle_deg: float = 80.0,
+    max_branch_angle_deg: float = 70.0,
     min_cluster_points: int = 3,
     auto_density: bool = True,
     density_grid_size: float = 6.0,
@@ -3006,10 +4382,14 @@ async def generate_and_export(
     max_density_supports: int = 160,
     density_target_coverage: float = 0.15,
     support_strategy: Literal["pro", "legacy"] = "pro",
-    pro_grid_size: float = 10.0,
+    pro_grid_size: float = 8.0,
     pro_min_points_per_cell: int = 1,
-    pro_max_supports: int = 120,
+    pro_max_supports: int = 90,
     pro_interface: bool = True,
+    external_tree: bool = True,
+    external_margin: float = 8.0,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
     smooth_branches: bool = True,
     export_even_if_infeasible: bool = True,
 ):
@@ -3059,12 +4439,16 @@ async def generate_and_export(
                     density_grid_size=density_grid_size,
                     density_min_points_per_cell=density_min_points_per_cell,
                     max_density_supports=max_density_supports,
-                    density_target_coverage=density_target_coverage,
+                    density_target_coverage=max(float(density_target_coverage), float(min_coverage)),
                     support_strategy=support_strategy,
                     pro_grid_size=pro_grid_size,
                     pro_min_points_per_cell=pro_min_points_per_cell,
                     pro_max_supports=pro_max_supports,
                     pro_interface=pro_interface,
+                    external_tree=external_tree,
+                    external_margin=external_margin,
+                    fast_mode=fast_mode,
+                    strict_collision=strict_collision,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -3110,12 +4494,16 @@ async def generate_and_export(
                             density_grid_size=density_grid_size,
                             density_min_points_per_cell=density_min_points_per_cell,
                             max_density_supports=max_density_supports,
-                            density_target_coverage=density_target_coverage,
+                            density_target_coverage=max(float(density_target_coverage), float(min_coverage)),
                             support_strategy=support_strategy,
                             pro_grid_size=pro_grid_size,
                             pro_min_points_per_cell=pro_min_points_per_cell,
                             pro_max_supports=pro_max_supports,
                             pro_interface=pro_interface,
+                            external_tree=external_tree,
+                            external_margin=external_margin,
+                            fast_mode=fast_mode,
+                            strict_collision=strict_collision,
                         )
                         all_results.append(result)
 
@@ -3178,12 +4566,16 @@ async def generate_and_export(
                 density_grid_size=density_grid_size,
                 density_min_points_per_cell=density_min_points_per_cell,
                 max_density_supports=max_density_supports,
-                density_target_coverage=density_target_coverage,
+                density_target_coverage=max(float(density_target_coverage), float(min_coverage)),
                 support_strategy=support_strategy,
                 pro_grid_size=pro_grid_size,
                 pro_min_points_per_cell=pro_min_points_per_cell,
                 pro_max_supports=pro_max_supports,
                 pro_interface=pro_interface,
+                external_tree=external_tree,
+                external_margin=external_margin,
+                fast_mode=fast_mode,
+                strict_collision=strict_collision,
             )
 
             if support_type == "classic":
