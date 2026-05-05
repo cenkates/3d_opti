@@ -86,9 +86,9 @@ class InvalidNozzleError(Exception):
 # =========================================================
 
 app = FastAPI(
-    title="3D Support Optimizer Beta V9.4",
-    description="Beta V9.4: goal programming + collision constraints + adaptive support density.",
-    version="9.4.0-beta",
+    title="3D Support Optimizer Beta V10.1 Tree Engine",
+    description="Beta V10.1: grouped Cura-style tree engine with trunk grouping, branch merge, interface layer, collision constraints, and goal programming.",
+    version="10.1.0-beta",
 )
 
 
@@ -729,7 +729,7 @@ class SupportGenerator:
         tip_gap_mm: float = 0.25,
         ray_clearance_mm: float = 0.8,
         downray_filter: bool = True,
-        max_branch_angle_deg: float = 65.0,
+        max_branch_angle_deg: float = 80.0,
         min_cluster_points: int = 3,
     ) -> Dict[str, Any]:
         """
@@ -1463,27 +1463,47 @@ def build_supports_for_orientation(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
-    max_branch_angle_deg: float = 65.0,
+    max_branch_angle_deg: float = 80.0,
     min_cluster_points: int = 3,
     auto_density: bool = True,
     density_grid_size: float = 6.0,
     density_min_points_per_cell: int = 2,
     max_density_supports: int = 160,
     density_target_coverage: float = 0.15,
+    support_strategy: str = "pro",
+    pro_grid_size: float = 10.0,
+    pro_min_points_per_cell: int = 1,
+    pro_max_supports: int = 120,
+    pro_interface: bool = True,
 ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     if support_type == "classic":
-        supports_list = classic_supports_collision_safe(
-            mesh=mesh,
-            points=points,
-            radius=support_radius,
-            bed_z=bed_z,
-            mesh_mass_g=mesh_mass_g,
-            min_height=1.0,
-            tip_gap_mm=tip_gap_mm,
-            ray_clearance_mm=ray_clearance_mm,
-            downray_filter=downray_filter,
-        )
-        classic_tree = {"trunks": [], "branches": supports_list}
+        if support_strategy == "pro":
+            supports_list = pro_classic_grid_supports(
+                mesh=mesh,
+                overhang_points=points,
+                radius=support_radius,
+                bed_z=bed_z,
+                mesh_mass_g=mesh_mass_g,
+                grid_size=pro_grid_size,
+                min_points_per_cell=pro_min_points_per_cell,
+                max_supports=pro_max_supports,
+                tip_gap_mm=tip_gap_mm,
+                ray_clearance_mm=ray_clearance_mm,
+                downray_filter=downray_filter,
+            )
+        else:
+            supports_list = classic_supports_collision_safe(
+                mesh=mesh,
+                points=points,
+                radius=support_radius,
+                bed_z=bed_z,
+                mesh_mass_g=mesh_mass_g,
+                min_height=1.0,
+                tip_gap_mm=tip_gap_mm,
+                ray_clearance_mm=ray_clearance_mm,
+                downray_filter=downray_filter,
+            )
+        classic_tree = {"trunks": [], "branches": supports_list, "interfaces": []}
         classic_tree["collision_count"] = 0
         classic_tree["disconnected_count"] = 0
         classic_tree["target_volume"] = float(target_volume)
@@ -1491,6 +1511,31 @@ def build_supports_for_orientation(
         classic_tree["big_m_collision"] = float(big_m_collision)
         classic_tree["big_m_disconnected"] = float(big_m_disconnected)
         return classic_tree, supports_list
+
+    if support_strategy == "pro":
+        supports = pro_tree_grid_supports(
+            mesh=mesh,
+            overhang_points=points,
+            bed_z=bed_z,
+            material=material,
+            nozzle_mm=nozzle_mm,
+            support_radius=support_radius,
+            mesh_mass_g=mesh_mass_g,
+            safety_factor=safety_factor,
+            grid_size=pro_grid_size,
+            min_points_per_cell=pro_min_points_per_cell,
+            max_supports=pro_max_supports,
+            tip_gap_mm=tip_gap_mm,
+            ray_clearance_mm=ray_clearance_mm,
+            downray_filter=downray_filter,
+            max_branch_angle_deg=max_branch_angle_deg,
+            add_interface=pro_interface,
+        )
+        supports["target_volume"] = float(target_volume)
+        supports["target_support_count"] = int(target_support_count)
+        supports["big_m_collision"] = float(big_m_collision)
+        supports["big_m_disconnected"] = float(big_m_disconnected)
+        return supports, None
 
     supports = SupportGenerator.load_aware_tree_supports(
         points,
@@ -1595,6 +1640,11 @@ def evaluate_orientation(
     density_min_points_per_cell: int,
     max_density_supports: int,
     density_target_coverage: float,
+    support_strategy: str,
+    pro_grid_size: float,
+    pro_min_points_per_cell: int,
+    pro_max_supports: int,
+    pro_interface: bool,
 ) -> AngleScanResult:
     try:
         mesh, points, bed_z = GeometryProcessor.process_rotated_mesh(
@@ -1636,6 +1686,11 @@ def evaluate_orientation(
             density_min_points_per_cell,
             max_density_supports,
             density_target_coverage,
+            support_strategy,
+            pro_grid_size,
+            pro_min_points_per_cell,
+            pro_max_supports,
+            pro_interface,
         )
 
         feasibility = PhysicsMotor.assess_support_feasibility(
@@ -1764,6 +1819,11 @@ def adaptive_scan_orientations(
     density_min_points_per_cell: int,
     max_density_supports: int,
     density_target_coverage: float,
+    support_strategy: str,
+    pro_grid_size: float,
+    pro_min_points_per_cell: int,
+    pro_max_supports: int,
+    pro_interface: bool,
     initial_step: float = 60.0,
     min_step: float = 1.0,
     top_k: int = 2,
@@ -1823,6 +1883,11 @@ def adaptive_scan_orientations(
             density_min_points_per_cell=density_min_points_per_cell,
             max_density_supports=max_density_supports,
             density_target_coverage=density_target_coverage,
+            support_strategy=support_strategy,
+            pro_grid_size=pro_grid_size,
+            pro_min_points_per_cell=pro_min_points_per_cell,
+            pro_max_supports=pro_max_supports,
+            pro_interface=pro_interface,
         )
 
     # Coarse grid. Include theta=90 even if step is 60.
@@ -1979,7 +2044,7 @@ def classic_supports_collision_safe(
     return supports
 
 
-def support_tree_has_valid_load_paths(tree: Dict[str, Any], max_branch_angle_deg: float = 65.0) -> int:
+def support_tree_has_valid_load_paths(tree: Dict[str, Any], max_branch_angle_deg: float = 80.0) -> int:
     """
     Count branches that are too horizontal to be physically reasonable.
     """
@@ -2235,6 +2300,396 @@ def generate_density_tree_additions(
     return prune_unused_trunks(existing_tree)
 
 
+
+# =========================================================
+# BETA V10 PRO SUPPORT GENERATOR
+# Cura / Prusa inspired grid + interface supports
+# =========================================================
+
+def pro_grid_support_points(
+    points: np.ndarray,
+    grid_size: float = 5.0,
+    min_points_per_cell: int = 1,
+    max_points: int = 500,
+) -> np.ndarray:
+    """
+    Cura/Prusa-like support density:
+    partition overhang area into XY cells and use one representative support per cell.
+    """
+    if len(points) == 0:
+        return np.empty((0, 3))
+
+    cells = {}
+    for p in points:
+        key = (int(np.floor(p[0] / grid_size)), int(np.floor(p[1] / grid_size)))
+        cells.setdefault(key, []).append(p)
+
+    reps = []
+    for _, pts in cells.items():
+        if len(pts) < min_points_per_cell:
+            continue
+        arr = np.asarray(pts)
+        # highest target in cell is safer for support interface
+        reps.append(arr[int(np.argmax(arr[:, 2]))])
+
+    if len(reps) == 0:
+        return np.empty((0, 3))
+
+    reps = np.asarray(reps)
+
+    if len(reps) > max_points:
+        # prioritize lower z overhangs slightly, then high density is capped
+        order = np.argsort(reps[:, 2])[-max_points:]
+        reps = reps[order]
+
+    return reps
+
+
+def pro_classic_grid_supports(
+    mesh: trimesh.Trimesh,
+    overhang_points: np.ndarray,
+    radius: float,
+    bed_z: float,
+    mesh_mass_g: float,
+    grid_size: float,
+    min_points_per_cell: int,
+    max_supports: int,
+    tip_gap_mm: float,
+    ray_clearance_mm: float,
+    downray_filter: bool,
+) -> List[Dict[str, float]]:
+    """
+    Realistic classic support:
+    - grid/density based, not every sample point
+    - vertical columns from bed to just below overhang
+    - collision filtered
+    """
+    pts = overhang_points
+    if downray_filter:
+        pts = filter_points_needing_support_by_downray(
+            mesh, pts, bed_z=bed_z, min_drop_mm=1.0, surface_offset_mm=0.35
+        )
+
+    reps = pro_grid_support_points(
+        pts,
+        grid_size=grid_size,
+        min_points_per_cell=min_points_per_cell,
+        max_points=max_supports,
+    )
+
+    if len(reps) == 0:
+        return []
+
+    point_load = StructuralAnalyzer.estimate_point_load_n(mesh_mass_g, len(reps))
+    supports = []
+
+    for p in reps:
+        x, y, z = float(p[0]), float(p[1]), float(p[2])
+        z_top = z - tip_gap_mm
+        height = z_top - bed_z
+        if height <= 1.0:
+            continue
+
+        # Centerline collision check; allow final contact near top.
+        if ray_hits_mesh_between(
+            mesh,
+            [x, y, bed_z + 0.5],
+            [x, y, z_top - 0.5],
+            clearance_mm=ray_clearance_mm + radius,
+        ):
+            continue
+
+        supports.append({
+            "x": x,
+            "y": y,
+            "z_bottom": float(bed_z),
+            "z_top": float(z_top),
+            "radius": float(radius),
+            "height": float(height),
+            "length": float(height),
+            "force_n": float(point_load),
+        })
+
+    return supports
+
+
+def pro_tree_grid_supports(
+    mesh: trimesh.Trimesh,
+    overhang_points: np.ndarray,
+    bed_z: float,
+    material: str,
+    nozzle_mm: float,
+    support_radius: float,
+    mesh_mass_g: float,
+    safety_factor: float,
+    grid_size: float,
+    min_points_per_cell: int,
+    max_supports: int,
+    tip_gap_mm: float,
+    ray_clearance_mm: float,
+    downray_filter: bool,
+    max_branch_angle_deg: float,
+    add_interface: bool = True,
+) -> Dict[str, Any]:
+    """
+    Beta V10.1 grouped tree engine.
+
+    Difference from V10.0:
+    - V10.0: every grid cell became its own vertical pillar.
+    - V10.1: grid cells are grouped into trunk regions.
+      Several contact points share one trunk, producing real tree-like branches.
+
+    This is not a full Cura implementation, but it is much closer:
+    contact cells -> grouped trunk centers -> short branch fan -> grounded trunk.
+    """
+    pts = overhang_points
+    if downray_filter:
+        pts = filter_points_needing_support_by_downray(
+            mesh, pts, bed_z=bed_z, min_drop_mm=1.0, surface_offset_mm=0.35
+        )
+
+    reps = pro_grid_support_points(
+        pts,
+        grid_size=grid_size,
+        min_points_per_cell=min_points_per_cell,
+        max_points=max_supports,
+    )
+
+    trunks: List[Dict[str, Any]] = []
+    branches: List[Dict[str, Any]] = []
+    interfaces: List[Dict[str, Any]] = []
+
+    if len(reps) == 0:
+        return {
+            "trunks": trunks,
+            "branches": branches,
+            "interfaces": interfaces,
+            "physics": {
+                "all_ok": False,
+                "reason": "No grid support points",
+                "trunk_count": 0,
+                "branch_count": 0,
+            },
+        }
+
+    # This is the critical slicer-like grouping control.
+    # Larger grid_size -> fewer contact reps.
+    # trunk_group_eps controls how many reps share one trunk.
+    trunk_group_eps = max(grid_size * 2.8, support_radius * 6.0)
+
+    labels = DBSCAN(eps=trunk_group_eps, min_samples=1).fit(reps[:, :2]).labels_
+    unique_labels = sorted(set(labels))
+
+    point_load_each = StructuralAnalyzer.estimate_point_load_n(mesh_mass_g, max(1, len(reps)))
+
+    for label in unique_labels:
+        group = reps[labels == label]
+        if len(group) == 0:
+            continue
+
+        # Limit branches per trunk to avoid a dense forest.
+        # Pick higher points first because they are usually more critical.
+        max_branches_for_trunk = 10
+        if len(group) > max_branches_for_trunk:
+            order = np.argsort(group[:, 2])[-max_branches_for_trunk:]
+            group = group[order]
+
+        # Trunk is placed below the group center, not below every single contact.
+        gx = float(np.mean(group[:, 0]))
+        gy = float(np.mean(group[:, 1]))
+        gz_min = float(np.min(group[:, 2]))
+        gz_mean = float(np.mean(group[:, 2]))
+
+        # Put trunk top below the lowest contact point in the group.
+        trunk_top_z = gz_min - max(4.0, support_radius * 2.2)
+        trunk_height = trunk_top_z - bed_z
+        if trunk_height <= 1.0:
+            continue
+
+        # Try a few nearby XY candidates so trunk does not pass through model.
+        candidate_offsets = [(0.0, 0.0)]
+        for ang in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+            candidate_offsets.append((
+                np.cos(ang) * max(1.5, grid_size * 0.35),
+                np.sin(ang) * max(1.5, grid_size * 0.35),
+            ))
+
+        chosen_xy = None
+        for ox, oy in candidate_offsets:
+            tx = gx + ox
+            ty = gy + oy
+
+            if not ray_hits_mesh_between(
+                mesh,
+                [tx, ty, bed_z + 0.5],
+                [tx, ty, trunk_top_z - 0.5],
+                clearance_mm=ray_clearance_mm + support_radius * 0.9,
+            ):
+                chosen_xy = (float(tx), float(ty))
+                break
+
+        if chosen_xy is None:
+            # If no collision-free trunk exists, skip this group.
+            continue
+
+        trunk_x, trunk_y = chosen_xy
+        group_force = point_load_each * max(1, len(group))
+
+        trunk_radius = StructuralAnalyzer.required_radius_for_force(
+            group_force,
+            trunk_height,
+            material,
+            nozzle_mm,
+            safety_factor,
+            visual_min_radius=support_radius * 1.45,
+        )
+
+        trunk_id = len(trunks)
+        trunk = {
+            "id": int(trunk_id),
+            "tree_id": int(trunk_id),
+            "x": float(trunk_x),
+            "y": float(trunk_y),
+            "z_bottom": float(bed_z),
+            "z_top": float(trunk_top_z),
+            "radius": float(trunk_radius),
+            "height": float(trunk_height),
+            "length": float(trunk_height),
+            "force_n": float(group_force),
+            "point_count": int(len(group)),
+            "ok": True,
+        }
+
+        local_branches = []
+        local_interfaces = []
+
+        for p in group:
+            px, py, pz = float(p[0]), float(p[1]), float(p[2])
+
+            # Contact point is slightly outside the model surface.
+            contact_x, contact_y, contact_z = contact_point_with_normal_offset(
+                (px, py, pz), gx, gy, tip_gap_mm
+            )
+
+            # Branch control point: halfway between trunk and contact with slight lift.
+            mid_x = (trunk_x + contact_x) / 2.0
+            mid_y = (trunk_y + contact_y) / 2.0
+            mid_z = (trunk_top_z + contact_z) / 2.0 + max(0.8, support_radius * 0.65)
+
+            a1 = branch_vertical_angle_deg(
+                [trunk_x, trunk_y, trunk_top_z],
+                [mid_x, mid_y, mid_z],
+            )
+            a2 = branch_vertical_angle_deg(
+                [mid_x, mid_y, mid_z],
+                [contact_x, contact_y, contact_z],
+            )
+
+            # Tree branches cannot be extremely horizontal.
+            if max(a1, a2) > max_branch_angle_deg:
+                continue
+
+            if curve_hits_mesh(
+                mesh,
+                [trunk_x, trunk_y, trunk_top_z],
+                [mid_x, mid_y, mid_z],
+                [contact_x, contact_y, contact_z],
+                clearance_mm=ray_clearance_mm + support_radius * 0.55,
+                samples=7,
+            ):
+                continue
+
+            branch_len = approximate_bezier_length(
+                [trunk_x, trunk_y, trunk_top_z],
+                [mid_x, mid_y, mid_z],
+                [contact_x, contact_y, contact_z],
+                samples=7,
+            )
+
+            branch_radius = StructuralAnalyzer.required_radius_for_force(
+                point_load_each,
+                branch_len,
+                material,
+                nozzle_mm,
+                safety_factor,
+                visual_min_radius=support_radius * 0.50,
+            )
+
+            local_branches.append({
+                "tree_id": int(trunk_id),
+                "trunk_id": int(trunk_id),
+                "x1": float(trunk_x),
+                "y1": float(trunk_y),
+                "z1": float(trunk_top_z),
+                "xm": float(mid_x),
+                "ym": float(mid_y),
+                "zm": float(mid_z),
+                "x2": float(contact_x),
+                "y2": float(contact_y),
+                "z2": float(contact_z),
+                "radius": float(branch_radius),
+                "height": float(contact_z - trunk_top_z),
+                "length": float(branch_len),
+                "force_n": float(point_load_each),
+                "ok": True,
+            })
+
+            if add_interface:
+                local_interfaces.append({
+                    "x": float(contact_x),
+                    "y": float(contact_y),
+                    "z": float(contact_z),
+                    "radius": float(max(support_radius * 1.10, grid_size * 0.18)),
+                    "height": float(max(0.35, nozzle_mm)),
+                })
+
+        # Avoid lonely trunk pillars with no valid branches.
+        if len(local_branches) == 0:
+            continue
+
+        trunks.append(trunk)
+        branches.extend(local_branches)
+        interfaces.extend(local_interfaces)
+
+    tree = {
+        "trunks": trunks,
+        "branches": branches,
+        "interfaces": interfaces,
+        "physics": {
+            "all_ok": True,
+            "trunk_count": len(trunks),
+            "branch_count": len(branches),
+            "interface_count": len(interfaces),
+            "engine": "grouped_tree_v10_1",
+        },
+    }
+
+    tree = prune_unused_trunks(tree)
+    tree["collision_count"] = collision_count_for_tree(tree, mesh, clearance_mm=ray_clearance_mm)
+    tree["disconnected_count"] = disconnected_count_for_tree(tree)
+    return tree
+
+
+def pro_interface_mesh(interfaces: List[Dict[str, float]]) -> trimesh.Trimesh:
+    """
+    Thin contact/interface disks like slicer support roof/interface.
+    """
+    meshes = []
+    for it in interfaces:
+        cyl = trimesh.creation.cylinder(
+            radius=float(it["radius"]),
+            height=float(it["height"]),
+            sections=24,
+        )
+        cyl.apply_translation([float(it["x"]), float(it["y"]), float(it["z"]) - float(it["height"]) / 2.0])
+        meshes.append(cyl)
+
+    if not meshes:
+        return trimesh.Trimesh()
+
+    return trimesh.util.concatenate(meshes)
+
+
 # =========================================================
 # API ROUTES
 # =========================================================
@@ -2255,7 +2710,7 @@ def root():
 def health_check():
     return {
         "status": "healthy",
-        "loaded_file_marker": "main_beta_v9_4_density_export_fixed",
+        "loaded_file_marker": "main_beta_v10_1_grouped_tree_engine",
         "version": "6.0.0",
         "supported_materials": list(MATERIALS.keys()),
         "supported_nozzles": ALLOWED_NOZZLES,
@@ -2268,7 +2723,10 @@ def health_check():
             "unused trunk pruning",
             "cluster minimum point threshold",
             "hard coverage and collision goals",
-            "adaptive density supports"
+            "adaptive density supports",
+            "pro grid support generator",
+            "support interface layer",
+            "grouped tree trunk engine"
         ],
     }
 
@@ -2306,13 +2764,18 @@ async def analyze_all_orientations(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
-    max_branch_angle_deg: float = 65.0,
+    max_branch_angle_deg: float = 80.0,
     min_cluster_points: int = 3,
     auto_density: bool = True,
     density_grid_size: float = 6.0,
     density_min_points_per_cell: int = 2,
     max_density_supports: int = 160,
     density_target_coverage: float = 0.15,
+    support_strategy: Literal["pro", "legacy"] = "pro",
+    pro_grid_size: float = 10.0,
+    pro_min_points_per_cell: int = 1,
+    pro_max_supports: int = 120,
+    pro_interface: bool = True,
 ):
     try:
         nozzle_mm = validate_nozzle(nozzle_mm)
@@ -2361,6 +2824,11 @@ async def analyze_all_orientations(
                     density_min_points_per_cell=density_min_points_per_cell,
                     max_density_supports=max_density_supports,
                     density_target_coverage=density_target_coverage,
+                    support_strategy=support_strategy,
+                    pro_grid_size=pro_grid_size,
+                    pro_min_points_per_cell=pro_min_points_per_cell,
+                    pro_max_supports=pro_max_supports,
+                    pro_interface=pro_interface,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -2407,6 +2875,11 @@ async def analyze_all_orientations(
                             density_min_points_per_cell=density_min_points_per_cell,
                             max_density_supports=max_density_supports,
                             density_target_coverage=density_target_coverage,
+                            support_strategy=support_strategy,
+                            pro_grid_size=pro_grid_size,
+                            pro_min_points_per_cell=pro_min_points_per_cell,
+                            pro_max_supports=pro_max_supports,
+                            pro_interface=pro_interface,
                         )
                         all_results.append(result)
 
@@ -2456,6 +2929,11 @@ async def analyze_all_orientations(
                     "density_min_points_per_cell": int(density_min_points_per_cell),
                     "max_density_supports": int(max_density_supports),
                     "density_target_coverage": float(density_target_coverage),
+                    "support_strategy": support_strategy,
+                    "pro_grid_size": float(pro_grid_size),
+                    "pro_min_points_per_cell": int(pro_min_points_per_cell),
+                    "pro_max_supports": int(pro_max_supports),
+                    "pro_interface": bool(pro_interface),
                 },
                 "summary": {
                     "total_orientations_tested": len(all_results),
@@ -2520,13 +2998,18 @@ async def generate_and_export(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
-    max_branch_angle_deg: float = 65.0,
+    max_branch_angle_deg: float = 80.0,
     min_cluster_points: int = 3,
     auto_density: bool = True,
     density_grid_size: float = 6.0,
     density_min_points_per_cell: int = 2,
     max_density_supports: int = 160,
     density_target_coverage: float = 0.15,
+    support_strategy: Literal["pro", "legacy"] = "pro",
+    pro_grid_size: float = 10.0,
+    pro_min_points_per_cell: int = 1,
+    pro_max_supports: int = 120,
+    pro_interface: bool = True,
     smooth_branches: bool = True,
     export_even_if_infeasible: bool = True,
 ):
@@ -2577,6 +3060,11 @@ async def generate_and_export(
                     density_min_points_per_cell=density_min_points_per_cell,
                     max_density_supports=max_density_supports,
                     density_target_coverage=density_target_coverage,
+                    support_strategy=support_strategy,
+                    pro_grid_size=pro_grid_size,
+                    pro_min_points_per_cell=pro_min_points_per_cell,
+                    pro_max_supports=pro_max_supports,
+                    pro_interface=pro_interface,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -2623,6 +3111,11 @@ async def generate_and_export(
                             density_min_points_per_cell=density_min_points_per_cell,
                             max_density_supports=max_density_supports,
                             density_target_coverage=density_target_coverage,
+                            support_strategy=support_strategy,
+                            pro_grid_size=pro_grid_size,
+                            pro_min_points_per_cell=pro_min_points_per_cell,
+                            pro_max_supports=pro_max_supports,
+                            pro_interface=pro_interface,
                         )
                         all_results.append(result)
 
@@ -2686,6 +3179,11 @@ async def generate_and_export(
                 density_min_points_per_cell=density_min_points_per_cell,
                 max_density_supports=max_density_supports,
                 density_target_coverage=density_target_coverage,
+                support_strategy=support_strategy,
+                pro_grid_size=pro_grid_size,
+                pro_min_points_per_cell=pro_min_points_per_cell,
+                pro_max_supports=pro_max_supports,
+                pro_interface=pro_interface,
             )
 
             if support_type == "classic":
