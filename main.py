@@ -86,9 +86,9 @@ class InvalidNozzleError(Exception):
 # =========================================================
 
 app = FastAPI(
-    title="3D Support Optimizer Beta V9.3",
-    description="Beta V9.3 / V10 logic: goal programming, collision-constrained classic/tree supports, adaptive search.",
-    version="9.3.0-beta",
+    title="3D Support Optimizer Beta V9.4",
+    description="Beta V9.4: goal programming + collision constraints + adaptive support density.",
+    version="9.4.0-beta",
 )
 
 
@@ -1418,6 +1418,7 @@ class AngleScanResult:
     compression_ok: bool
     buckling_ok: bool
     support_count: int
+    error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1433,7 +1434,8 @@ class AngleScanResult:
             "physics": {
                 "compression_ok": self.compression_ok,
                 "buckling_ok": self.buckling_ok,
-            }
+            },
+            "error": self.error,
         }
 
 
@@ -1461,6 +1463,13 @@ def build_supports_for_orientation(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
+    max_branch_angle_deg: float = 65.0,
+    min_cluster_points: int = 3,
+    auto_density: bool = True,
+    density_grid_size: float = 6.0,
+    density_min_points_per_cell: int = 2,
+    max_density_supports: int = 160,
+    density_target_coverage: float = 0.15,
 ) -> Tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]:
     if support_type == "classic":
         supports_list = classic_supports_collision_safe(
@@ -1507,6 +1516,33 @@ def build_supports_for_orientation(
         min_cluster_points=min_cluster_points,
     )
     supports = prune_unused_trunks(supports)
+
+    if auto_density:
+        center_x = float(points[:, 0].mean()) if len(points) else 0.0
+        center_y = float(points[:, 1].mean()) if len(points) else 0.0
+        supports = generate_density_tree_additions(
+            mesh=mesh,
+            all_points=points,
+            existing_tree=supports,
+            bed_z=bed_z,
+            material=material,
+            nozzle_mm=nozzle_mm,
+            support_radius=support_radius,
+            mesh_mass_g=mesh_mass_g,
+            safety_factor=safety_factor,
+            center_x=center_x,
+            center_y=center_y,
+            target_coverage=max(float(density_target_coverage), 0.0),
+            max_xy_distance=8.0,
+            density_grid_size=density_grid_size,
+            density_min_points_per_cell=density_min_points_per_cell,
+            max_density_supports=max_density_supports,
+            collision_margin=collision_margin,
+            tip_gap_mm=tip_gap_mm,
+            ray_clearance_mm=ray_clearance_mm,
+            max_branch_angle_deg=max_branch_angle_deg,
+        )
+
     load_path_bad_count = support_tree_has_valid_load_paths(
         supports,
         max_branch_angle_deg=max_branch_angle_deg,
@@ -1554,6 +1590,11 @@ def evaluate_orientation(
     big_m_disconnected: float,
     max_branch_angle_deg: float,
     min_cluster_points: int,
+    auto_density: bool,
+    density_grid_size: float,
+    density_min_points_per_cell: int,
+    max_density_supports: int,
+    density_target_coverage: float,
 ) -> AngleScanResult:
     try:
         mesh, points, bed_z = GeometryProcessor.process_rotated_mesh(
@@ -1590,6 +1631,11 @@ def evaluate_orientation(
             big_m_disconnected,
             max_branch_angle_deg,
             min_cluster_points,
+            auto_density,
+            density_grid_size,
+            density_min_points_per_cell,
+            max_density_supports,
+            density_target_coverage,
         )
 
         feasibility = PhysicsMotor.assess_support_feasibility(
@@ -1621,7 +1667,7 @@ def evaluate_orientation(
         )
 
     except Exception as e:
-        logger.error(f"Error evaluating rho={rho_deg}, theta={theta_deg}: {e}")
+        logger.exception(f"Error evaluating rho={rho_deg}, theta={theta_deg}: {e}")
         return AngleScanResult(
             rho=float(rho_deg),
             theta=float(theta_deg),
@@ -1634,6 +1680,7 @@ def evaluate_orientation(
             compression_ok=False,
             buckling_ok=False,
             support_count=0,
+            error=str(e),
         )
 
 
@@ -1712,6 +1759,11 @@ def adaptive_scan_orientations(
     big_m_disconnected: float,
     max_branch_angle_deg: float,
     min_cluster_points: int,
+    auto_density: bool,
+    density_grid_size: float,
+    density_min_points_per_cell: int,
+    max_density_supports: int,
+    density_target_coverage: float,
     initial_step: float = 60.0,
     min_step: float = 1.0,
     top_k: int = 2,
@@ -1766,6 +1818,11 @@ def adaptive_scan_orientations(
             big_m_disconnected=big_m_disconnected,
             max_branch_angle_deg=max_branch_angle_deg,
             min_cluster_points=min_cluster_points,
+            auto_density=auto_density,
+            density_grid_size=density_grid_size,
+            density_min_points_per_cell=density_min_points_per_cell,
+            max_density_supports=max_density_supports,
+            density_target_coverage=density_target_coverage,
         )
 
     # Coarse grid. Include theta=90 even if step is 60.
@@ -1935,6 +1992,249 @@ def support_tree_has_valid_load_paths(tree: Dict[str, Any], max_branch_angle_deg
     return int(bad)
 
 
+
+# =========================================================
+# BETA V9.4 ADAPTIVE SUPPORT DENSITY HELPERS
+# =========================================================
+
+def grid_density_points(
+    points: np.ndarray,
+    grid_size: float = 6.0,
+    min_points_per_cell: int = 2,
+    max_cells: int = 240,
+) -> np.ndarray:
+    """
+    Partition overhang points into XY grid cells.
+    Each dense cell becomes one representative support contact point.
+    This solves the old problem: 5000 samples but only 5 trunks.
+    """
+    if len(points) == 0:
+        return np.empty((0, 3))
+
+    grid = {}
+    for p in points:
+        key = (int(np.floor(p[0] / grid_size)), int(np.floor(p[1] / grid_size)))
+        grid.setdefault(key, []).append(p)
+
+    reps = []
+    for _, pts in grid.items():
+        if len(pts) < min_points_per_cell:
+            continue
+        arr = np.array(pts)
+        # use highest point in that cell as contact target
+        idx = int(np.argmax(arr[:, 2]))
+        reps.append(arr[idx])
+
+    if len(reps) == 0:
+        return np.empty((0, 3))
+
+    reps = np.array(reps)
+
+    # Prioritize higher unsupported points if too many cells.
+    if len(reps) > max_cells:
+        order = np.argsort(reps[:, 2])[-max_cells:]
+        reps = reps[order]
+
+    return reps
+
+
+def calculate_coverage_for_contact_points(points: np.ndarray, contact_points: np.ndarray, max_xy_distance: float = 8.0) -> float:
+    if len(points) == 0:
+        return 1.0
+    if len(contact_points) == 0:
+        return 0.0
+
+    supported = 0
+    for p in points:
+        dxy = np.sqrt((contact_points[:, 0] - p[0]) ** 2 + (contact_points[:, 1] - p[1]) ** 2)
+        z_ok = contact_points[:, 2] <= p[2] + 3.0
+        if np.any((dxy <= max_xy_distance) & z_ok):
+            supported += 1
+
+    return float(supported / len(points))
+
+
+def extra_points_for_uncovered_regions(
+    all_points: np.ndarray,
+    current_contacts: np.ndarray,
+    grid_size: float = 6.0,
+    max_xy_distance: float = 8.0,
+    min_points_per_cell: int = 2,
+    max_extra_points: int = 160,
+) -> np.ndarray:
+    """
+    Select representative points from regions not covered by existing contacts.
+    """
+    if len(all_points) == 0:
+        return np.empty((0, 3))
+
+    uncovered = []
+    if len(current_contacts) == 0:
+        uncovered = all_points
+    else:
+        for p in all_points:
+            dxy = np.sqrt((current_contacts[:, 0] - p[0]) ** 2 + (current_contacts[:, 1] - p[1]) ** 2)
+            z_ok = current_contacts[:, 2] <= p[2] + 3.0
+            if not np.any((dxy <= max_xy_distance) & z_ok):
+                uncovered.append(p)
+        uncovered = np.array(uncovered) if len(uncovered) else np.empty((0, 3))
+
+    if len(uncovered) == 0:
+        return np.empty((0, 3))
+
+    return grid_density_points(
+        uncovered,
+        grid_size=grid_size,
+        min_points_per_cell=min_points_per_cell,
+        max_cells=max_extra_points,
+    )
+
+
+def generate_density_tree_additions(
+    mesh: trimesh.Trimesh,
+    all_points: np.ndarray,
+    existing_tree: Dict[str, Any],
+    bed_z: float,
+    material: str,
+    nozzle_mm: float,
+    support_radius: float,
+    mesh_mass_g: float,
+    safety_factor: float,
+    center_x: float,
+    center_y: float,
+    target_coverage: float,
+    max_xy_distance: float,
+    density_grid_size: float,
+    density_min_points_per_cell: int,
+    max_density_supports: int,
+    collision_margin: float,
+    tip_gap_mm: float,
+    ray_clearance_mm: float,
+    max_branch_angle_deg: float,
+) -> Dict[str, Any]:
+    """
+    If generated tree coverage is too low, add direct safe mini tree supports
+    at uncovered grid cells until density is sufficient.
+    """
+    contacts = np.array(PhysicsMotor.calculate_contact_points(existing_tree))
+    current_coverage = calculate_coverage_for_contact_points(all_points, contacts, max_xy_distance)
+
+    if current_coverage >= target_coverage:
+        return existing_tree
+
+    extra_points = extra_points_for_uncovered_regions(
+        all_points,
+        contacts,
+        grid_size=density_grid_size,
+        max_xy_distance=max_xy_distance,
+        min_points_per_cell=density_min_points_per_cell,
+        max_extra_points=max_density_supports,
+    )
+
+    if len(extra_points) == 0:
+        return existing_tree
+
+    point_load = StructuralAnalyzer.estimate_point_load_n(mesh_mass_g, max(1, len(all_points)))
+    next_id = len(existing_tree.get("trunks", []))
+
+    for p in extra_points:
+        px, py, pz = float(p[0]), float(p[1]), float(p[2])
+        contact_x, contact_y, contact_z = contact_point_with_normal_offset((px, py, pz), center_x, center_y, tip_gap_mm)
+
+        # Create an almost vertical trunk slightly outward from the contact.
+        ux, uy = outward_unit_from_center(contact_x, contact_y, center_x, center_y)
+        trunk_x = contact_x + ux * max(1.0, support_radius * 1.2)
+        trunk_y = contact_y + uy * max(1.0, support_radius * 1.2)
+        trunk_x, trunk_y = push_point_outside_xy_bbox(
+            trunk_x, trunk_y, center_x, center_y, mesh.bounds, margin=collision_margin * 0.5
+        )
+
+        trunk_top_z = max(bed_z + 2.0, contact_z - max(2.5, support_radius * 2.0))
+        trunk_height = trunk_top_z - bed_z
+        if trunk_height <= 1.0:
+            continue
+
+        trunk_force = point_load
+        trunk_radius = StructuralAnalyzer.required_radius_for_force(
+            trunk_force, trunk_height, material, nozzle_mm, safety_factor, visual_min_radius=support_radius * 1.4
+        )
+
+        # Control point: mostly vertical, slight outward curve.
+        mid_x = (trunk_x + contact_x) / 2.0 + ux * max(1.0, support_radius * 1.5)
+        mid_y = (trunk_y + contact_y) / 2.0 + uy * max(1.0, support_radius * 1.5)
+        mid_z = (trunk_top_z + contact_z) / 2.0 + max(1.0, support_radius)
+
+        # Do not add physically too-horizontal branches.
+        if max(
+            branch_vertical_angle_deg([trunk_x, trunk_y, trunk_top_z], [mid_x, mid_y, mid_z]),
+            branch_vertical_angle_deg([mid_x, mid_y, mid_z], [contact_x, contact_y, contact_z])
+        ) > max_branch_angle_deg:
+            continue
+
+        # Hard collision check.
+        if curve_hits_mesh(
+            mesh,
+            [trunk_x, trunk_y, trunk_top_z],
+            [mid_x, mid_y, mid_z],
+            [contact_x, contact_y, contact_z],
+            clearance_mm=ray_clearance_mm + support_radius * 0.45,
+            samples=8,
+        ):
+            continue
+
+        branch_len = approximate_bezier_length(
+            [trunk_x, trunk_y, trunk_top_z],
+            [mid_x, mid_y, mid_z],
+            [contact_x, contact_y, contact_z],
+            samples=8,
+        )
+        branch_radius = StructuralAnalyzer.required_radius_for_force(
+            point_load, branch_len, material, nozzle_mm, safety_factor, visual_min_radius=support_radius * 0.45
+        )
+
+        existing_tree.setdefault("trunks", []).append({
+            "id": int(next_id),
+            "tree_id": int(next_id),
+            "x": float(trunk_x),
+            "y": float(trunk_y),
+            "z_bottom": float(bed_z),
+            "z_top": float(trunk_top_z),
+            "radius": float(trunk_radius),
+            "height": float(trunk_height),
+            "length": float(trunk_height),
+            "force_n": float(point_load),
+            "point_count": 1,
+            "ok": True,
+        })
+
+        existing_tree.setdefault("branches", []).append({
+            "tree_id": int(next_id),
+            "trunk_id": int(next_id),
+            "x1": float(trunk_x),
+            "y1": float(trunk_y),
+            "z1": float(trunk_top_z),
+            "xm": float(mid_x),
+            "ym": float(mid_y),
+            "zm": float(mid_z),
+            "x2": float(contact_x),
+            "y2": float(contact_y),
+            "z2": float(contact_z),
+            "radius": float(branch_radius),
+            "height": float(contact_z - trunk_top_z),
+            "length": float(branch_len),
+            "force_n": float(point_load),
+            "ok": True,
+        })
+        next_id += 1
+
+        contacts = np.array(PhysicsMotor.calculate_contact_points(existing_tree))
+        current_coverage = calculate_coverage_for_contact_points(all_points, contacts, max_xy_distance)
+        if current_coverage >= target_coverage:
+            break
+
+    return prune_unused_trunks(existing_tree)
+
+
 # =========================================================
 # API ROUTES
 # =========================================================
@@ -1955,6 +2255,7 @@ def root():
 def health_check():
     return {
         "status": "healthy",
+        "loaded_file_marker": "main_beta_v9_4_density_export_fixed",
         "version": "6.0.0",
         "supported_materials": list(MATERIALS.keys()),
         "supported_nozzles": ALLOWED_NOZZLES,
@@ -1966,7 +2267,8 @@ def health_check():
             "tree branch maximum angle constraint",
             "unused trunk pruning",
             "cluster minimum point threshold",
-            "hard coverage and collision goals"
+            "hard coverage and collision goals",
+            "adaptive density supports"
         ],
     }
 
@@ -2006,6 +2308,11 @@ async def analyze_all_orientations(
     big_m_disconnected: float = BIG_M_DEFAULT,
     max_branch_angle_deg: float = 65.0,
     min_cluster_points: int = 3,
+    auto_density: bool = True,
+    density_grid_size: float = 6.0,
+    density_min_points_per_cell: int = 2,
+    max_density_supports: int = 160,
+    density_target_coverage: float = 0.15,
 ):
     try:
         nozzle_mm = validate_nozzle(nozzle_mm)
@@ -2049,6 +2356,11 @@ async def analyze_all_orientations(
                     big_m_disconnected=big_m_disconnected,
                     max_branch_angle_deg=max_branch_angle_deg,
                     min_cluster_points=min_cluster_points,
+                    auto_density=auto_density,
+                    density_grid_size=density_grid_size,
+                    density_min_points_per_cell=density_min_points_per_cell,
+                    max_density_supports=max_density_supports,
+                    density_target_coverage=density_target_coverage,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -2090,6 +2402,11 @@ async def analyze_all_orientations(
                             big_m_disconnected=big_m_disconnected,
                             max_branch_angle_deg=max_branch_angle_deg,
                             min_cluster_points=min_cluster_points,
+                            auto_density=auto_density,
+                            density_grid_size=density_grid_size,
+                            density_min_points_per_cell=density_min_points_per_cell,
+                            max_density_supports=max_density_supports,
+                            density_target_coverage=density_target_coverage,
                         )
                         all_results.append(result)
 
@@ -2134,6 +2451,11 @@ async def analyze_all_orientations(
                     "big_m_disconnected": float(big_m_disconnected),
                     "max_branch_angle_deg": float(max_branch_angle_deg),
                     "min_cluster_points": int(min_cluster_points),
+                    "auto_density": bool(auto_density),
+                    "density_grid_size": float(density_grid_size),
+                    "density_min_points_per_cell": int(density_min_points_per_cell),
+                    "max_density_supports": int(max_density_supports),
+                    "density_target_coverage": float(density_target_coverage),
                 },
                 "summary": {
                     "total_orientations_tested": len(all_results),
@@ -2198,6 +2520,13 @@ async def generate_and_export(
     target_support_count: int = 180,
     big_m_collision: float = BIG_M_DEFAULT,
     big_m_disconnected: float = BIG_M_DEFAULT,
+    max_branch_angle_deg: float = 65.0,
+    min_cluster_points: int = 3,
+    auto_density: bool = True,
+    density_grid_size: float = 6.0,
+    density_min_points_per_cell: int = 2,
+    max_density_supports: int = 160,
+    density_target_coverage: float = 0.15,
     smooth_branches: bool = True,
     export_even_if_infeasible: bool = True,
 ):
@@ -2243,6 +2572,11 @@ async def generate_and_export(
                     big_m_disconnected=big_m_disconnected,
                     max_branch_angle_deg=max_branch_angle_deg,
                     min_cluster_points=min_cluster_points,
+                    auto_density=auto_density,
+                    density_grid_size=density_grid_size,
+                    density_min_points_per_cell=density_min_points_per_cell,
+                    max_density_supports=max_density_supports,
+                    density_target_coverage=density_target_coverage,
                     initial_step=adaptive_initial_step,
                     min_step=adaptive_min_step,
                     top_k=adaptive_top_k,
@@ -2284,6 +2618,11 @@ async def generate_and_export(
                             big_m_disconnected=big_m_disconnected,
                             max_branch_angle_deg=max_branch_angle_deg,
                             min_cluster_points=min_cluster_points,
+                            auto_density=auto_density,
+                            density_grid_size=density_grid_size,
+                            density_min_points_per_cell=density_min_points_per_cell,
+                            max_density_supports=max_density_supports,
+                            density_target_coverage=density_target_coverage,
                         )
                         all_results.append(result)
 
@@ -2342,6 +2681,11 @@ async def generate_and_export(
                 big_m_disconnected=big_m_disconnected,
                 max_branch_angle_deg=max_branch_angle_deg,
                 min_cluster_points=min_cluster_points,
+                auto_density=auto_density,
+                density_grid_size=density_grid_size,
+                density_min_points_per_cell=density_min_points_per_cell,
+                max_density_supports=max_density_supports,
+                density_target_coverage=density_target_coverage,
             )
 
             if support_type == "classic":
