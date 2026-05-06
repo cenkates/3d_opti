@@ -4628,6 +4628,168 @@ async def generate_and_export(
             raise HTTPException(status_code=400, detail=str(e))
 
 
+
+# =========================================================
+# FIXED ORIENTATION ANALYSIS ENDPOINT
+# Added for poster/data collection scans:
+# Analyze exactly one rho/theta pair and return JSON.
+# =========================================================
+
+@app.post("/analyze-fixed")
+async def analyze_fixed_orientation(
+    file: UploadFile = File(...),
+    rho: float = 0.0,
+    theta: float = 0.0,
+
+    support_type: str = "classic",
+    material: str = "PLA",
+    nozzle_mm: float = 0.4,
+    support_radius: float = 1.8,
+    mesh_mass_g: float = 100.0,
+    safety_factor: float = 2.0,
+    critical_angle_deg: float = 45.0,
+    min_coverage: float = 0.3,
+    sample_points: int = 500,
+    max_xy_distance: float = 8.0,
+
+    tree_eps: float = 8.0,
+    branch_merge_eps: float = 2.5,
+    max_branches_per_tree: int = 240,
+    trunk_outside_offset: float = 10.0,
+    branch_outside_offset: float = 35.0,
+    branch_curve_lift: float = 8.0,
+    collision_margin: float = 10.0,
+    tip_gap_mm: float = 0.25,
+    ray_clearance_mm: float = 0.8,
+    downray_filter: bool = True,
+
+    target_volume: float = 180000.0,
+    target_support_count: int = 180,
+    big_m_collision: float = 1000000.0,
+    big_m_disconnected: float = 1000000.0,
+
+    max_branch_angle_deg: float = 70.0,
+    min_cluster_points: int = 3,
+
+    auto_density: bool = True,
+    density_grid_size: float = 6.0,
+    density_min_points_per_cell: int = 2,
+    max_density_supports: int = 160,
+    density_target_coverage: float = 0.15,
+
+    support_strategy: str = "pro",
+    pro_grid_size: float = 8.0,
+    pro_min_points_per_cell: int = 1,
+    pro_max_supports: int = 90,
+    pro_interface: bool = True,
+
+    external_tree: bool = True,
+    external_margin: float = 8.0,
+    fast_mode: bool = True,
+    strict_collision: bool = False,
+):
+    """
+    Analyze exactly one orientation.
+
+    Use this endpoint for data collection and MATLAB graphs.
+    Unlike /analyze, this does NOT run adaptive or full scan.
+    It only evaluates the requested rho/theta pair.
+    """
+    import inspect
+
+    tmp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".stl") as tmp:
+            tmp_path = tmp.name
+            tmp.write(await file.read())
+
+        original_mesh = trimesh.load(tmp_path, force="mesh")
+
+        if isinstance(original_mesh, trimesh.Scene):
+            original_mesh = trimesh.util.concatenate(tuple(original_mesh.geometry.values()))
+
+        sig = inspect.signature(evaluate_orientation)
+
+        kwargs = {
+            "original_mesh": original_mesh,
+            "rho_deg": float(rho),
+            "theta_deg": float(theta),
+            "support_type": support_type,
+            "material": material,
+            "nozzle_mm": nozzle_mm,
+            "support_radius": support_radius,
+            "mesh_mass_g": mesh_mass_g,
+            "safety_factor": safety_factor,
+            "critical_angle_deg": critical_angle_deg,
+            "min_coverage": min_coverage,
+            "sample_points": sample_points,
+            "max_xy_distance": max_xy_distance,
+            "tree_eps": tree_eps,
+            "branch_merge_eps": branch_merge_eps,
+            "max_branches_per_tree": max_branches_per_tree,
+            "trunk_outside_offset": trunk_outside_offset,
+            "branch_outside_offset": branch_outside_offset,
+            "branch_curve_lift": branch_curve_lift,
+            "collision_margin": collision_margin,
+            "tip_gap_mm": tip_gap_mm,
+            "ray_clearance_mm": ray_clearance_mm,
+            "downray_filter": downray_filter,
+            "target_volume": target_volume,
+            "target_support_count": target_support_count,
+            "big_m_collision": big_m_collision,
+            "big_m_disconnected": big_m_disconnected,
+            "max_branch_angle_deg": max_branch_angle_deg,
+            "min_cluster_points": min_cluster_points,
+            "auto_density": auto_density,
+            "density_grid_size": density_grid_size,
+            "density_min_points_per_cell": density_min_points_per_cell,
+            "max_density_supports": max_density_supports,
+            "density_target_coverage": density_target_coverage,
+            "support_strategy": support_strategy,
+            "pro_grid_size": pro_grid_size,
+            "pro_min_points_per_cell": pro_min_points_per_cell,
+            "pro_max_supports": pro_max_supports,
+            "pro_interface": pro_interface,
+            "external_tree": external_tree,
+            "external_margin": external_margin,
+            "fast_mode": fast_mode,
+            "strict_collision": strict_collision,
+        }
+
+        # Keep compatibility if evaluate_orientation signature changes.
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in sig.parameters
+        }
+
+        result = evaluate_orientation(**kwargs)
+        result_dict = result.to_dict() if hasattr(result, "to_dict") else result
+
+        return {
+            "filename": file.filename,
+            "analysis_type": "fixed_orientation",
+            "rho": float(rho),
+            "theta": float(theta),
+            "support_type": support_type,
+            "material": material,
+            "sample_points": int(sample_points),
+            "result": result_dict,
+        }
+
+    except Exception as e:
+        logger.exception(f"Error in /analyze-fixed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 # =========================================================
 # MAIN
 # =========================================================
